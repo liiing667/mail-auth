@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file. This projec
 
 ### Fixed
 - DKIM1: `DkimSigningStream` hashed the body from the first `\r\n\r\n` instead of where the header section ends, so a header line without a colon or a bare LF empty line produced a body hash that did not verify.
+- DMARC: the DNS Tree Walk (RFC 9989, Section 4.10) skipped every ancestor between a deep Author Domain and its seven-label suffix, so records on those ancestors were never discovered. The walk now queries the Author Domain first, jumps to the seven-label suffix only on its next step, and then removes one label per query, capped at eight queries, still stopping on `psd=y`/`psd=n`.
 
 ## [0.15.1] - 2026-10-30
 

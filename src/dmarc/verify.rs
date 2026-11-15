@@ -388,6 +388,12 @@ impl MessageAuthenticator {
     /// Performs a DNS Tree Walk (RFC 9989 Section 4.10) starting at `domain`
     /// and returns every valid DMARC Policy Record found from the starting
     /// point (longest name) up to the top-level domain (shortest name).
+    ///
+    /// The walk always starts at `domain` and performs at most eight DNS
+    /// queries. When `domain` has more than eight labels, the first step
+    /// removes the leftmost labels until only seven remain (skipping the
+    /// intermediate ancestors); every subsequent step removes a single
+    /// label. A record carrying `psd=y` or `psd=n` stops the walk.
     async fn dmarc_tree_walk<'x>(
         &self,
         domain: &'x str,
@@ -399,14 +405,17 @@ impl MessageAuthenticator {
             return Ok(found);
         }
 
-        let mut count = total;
+        let mut labels_left = total;
+        let mut removed = 0;
+        let mut queries = 0;
         let mut key = String::with_capacity(domain.len() + DMARC_PREFIX.len() + 1);
         loop {
-            let name = drop_leftmost_labels(domain, total - count);
+            let name = drop_leftmost_labels(domain, removed);
             key.clear();
             key.push_str(DMARC_PREFIX);
             key.push_str(name);
             key.push('.');
+            queries += 1;
             match self.txt_lookup::<DmarcRecord>(&key, txt_cache).await {
                 Ok(dmarc) => {
                     let stop = matches!(dmarc.psd, Psd::Yes | Psd::No);
@@ -420,10 +429,17 @@ impl MessageAuthenticator {
                 Err(err) => return Err(err),
             }
 
-            if count == 1 {
+            if labels_left == 1 || queries == 8 {
                 break;
             }
-            count = if count >= 8 { 7 } else { count - 1 };
+            if labels_left > 8 {
+                let skip = labels_left - 7;
+                removed += skip;
+                labels_left -= skip;
+            } else {
+                removed += 1;
+                labels_left -= 1;
+            }
         }
 
         Ok(found)

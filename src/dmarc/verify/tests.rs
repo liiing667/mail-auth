@@ -385,10 +385,13 @@ async fn dmarc_tree_walk_query_cap() {
     let resolver = MessageAuthenticator::new_system_conf().unwrap();
     let expires = Instant::now() + Duration::new(3200, 0);
 
+    // RFC 9989 Section 4.10: for a 13-label Author Domain the walk starts
+    // at the Author Domain and then jumps to the 7-label suffix
+    // (g.h.i.j.mail.example.com); intermediate ancestors are never queried.
     let caches = DummyCaches::new();
     caches.txt_add(
-        "_dmarc.example.com.",
-        DmarcRecord::parse(b"v=DMARC1; p=reject; np=none; rua=mailto:d@example.com").unwrap(),
+        "_dmarc.g.h.i.j.mail.example.com.",
+        DmarcRecord::parse(b"v=DMARC1; p=quarantine; rua=mailto:d@example.com").unwrap(),
         expires,
     );
     assert_eq!(
@@ -398,7 +401,104 @@ async fn dmarc_tree_walk_query_cap() {
             "hello@a.b.c.d.e.f.g.h.i.j.mail.example.com",
         )
         .await,
-        Policy::None,
+        Policy::Quarantine,
+    );
+
+    // A `psd=n` record at the first jumped-to ancestor stops the walk, so
+    // records further up the tree are never discovered.
+    let caches = DummyCaches::new();
+    caches.txt_add(
+        "_dmarc.g.h.i.j.mail.example.org.",
+        DmarcRecord::parse(b"v=DMARC1; p=quarantine; psd=n; rua=mailto:d@example.org").unwrap(),
+        expires,
+    );
+    caches.txt_add(
+        "_dmarc.example.org.",
+        DmarcRecord::parse(b"v=DMARC1; p=reject; rua=mailto:d@example.org").unwrap(),
+        expires,
+    );
+    assert_eq!(
+        policy_of(
+            &resolver,
+            &caches,
+            "hello@a.b.c.d.e.f.g.h.i.j.mail.example.org",
+        )
+        .await,
+        Policy::Quarantine,
+    );
+
+    // RFC 9989 Section 4.10 query sequence for a 13-label domain: the
+    // Author Domain, the 7-label suffix after the multi-label jump, then
+    // one label at a time, for eight queries in total; ancestors above
+    // the TLD query are never reached.
+    let caches = DummyCaches::new();
+    for name in [
+        "_dmarc.g.h.i.j.mail.example.test.",
+        "_dmarc.h.i.j.mail.example.test.",
+        "_dmarc.i.j.mail.example.test.",
+        "_dmarc.j.mail.example.test.",
+        "_dmarc.mail.example.test.",
+        "_dmarc.example.test.",
+        "_dmarc.test.",
+    ] {
+        caches.txt_add(
+            name,
+            DmarcRecord::parse(b"v=DMARC1; p=reject; rua=mailto:d@example.test").unwrap(),
+            expires,
+        );
+    }
+    let walk = resolver
+        .dmarc_tree_walk("a.b.c.d.e.f.g.h.i.j.mail.example.test", Some(&caches.txt))
+        .await
+        .unwrap();
+    assert_eq!(
+        walk.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        vec![
+            "g.h.i.j.mail.example.test",
+            "h.i.j.mail.example.test",
+            "i.j.mail.example.test",
+            "j.mail.example.test",
+            "mail.example.test",
+            "example.test",
+            "test",
+        ],
+        "the walk covers exactly the eight RFC 9989 query targets",
+    );
+
+    // A nine-label domain spends its first query on the Author Domain,
+    // jumps to its seven-label suffix and then walks six more times: the
+    // TLD would be a ninth query and is never reached.
+    let caches = DummyCaches::new();
+    caches.txt_add(
+        "_dmarc.h.",
+        DmarcRecord::parse(b"v=DMARC1; p=reject; rua=mailto:d@h").unwrap(),
+        expires,
+    );
+    let walk = resolver
+        .dmarc_tree_walk("a.b.c.d.e.f.g.h.i", Some(&caches.txt))
+        .await
+        .unwrap();
+    assert!(walk.is_empty(), "a ninth query (the TLD) is never issued");
+
+    // The Author Domain itself is always the first query target.
+    let caches = DummyCaches::new();
+    caches.txt_add(
+        "_dmarc.a.b.c.d.e.f.g.h.",
+        DmarcRecord::parse(b"v=DMARC1; p=reject; rua=mailto:d@h").unwrap(),
+        expires,
+    );
+    caches.txt_add(
+        "_dmarc.b.c.d.e.f.g.h.",
+        DmarcRecord::parse(b"v=DMARC1; p=none; rua=mailto:d@h").unwrap(),
+        expires,
+    );
+    let walk = resolver
+        .dmarc_tree_walk("a.b.c.d.e.f.g.h", Some(&caches.txt))
+        .await
+        .unwrap();
+    assert_eq!(
+        walk.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        vec!["a.b.c.d.e.f.g.h", "b.c.d.e.f.g.h"],
     );
 }
 

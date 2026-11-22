@@ -60,6 +60,10 @@ pub use dns::{
     ResolverCache, TxtRecord,
 };
 pub use error::{DnsError, Error, Result};
-pub use iprev::{IprevOutput, IprevResult};
+pub use iprev::{
+    IprevEvaluation, IprevEvaluationOutput, IprevEvaluationReport, IprevForward,
+    IprevForwardOutput, IprevIdentity, IprevIdentityReport, IprevOutput, IprevReport, IprevResult,
+    IprevTransaction, IprevTransactionOutput, IprevTransactionReport, IprevVerification,
+};
 pub use message::AuthenticatedMessage;
 pub use spf::{SpfOutput, SpfResult};

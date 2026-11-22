@@ -304,7 +304,14 @@ impl<'x> AuthenticationResults<'x> {
     /// `policy.iprev`.
     pub fn set_iprev_result(&mut self, iprev: &IprevOutput, remote_ip: IpAddr) {
         self.auth_results.push_str(";\r\n\tiprev=");
-        iprev.result.as_auth_result(&mut self.auth_results);
+        if iprev.client_ip().is_some_and(|client_ip| client_ip != remote_ip) {
+            // The output belongs to another SMTP hop. Reporting its pass or
+            // failure under this message's address would assign the other
+            // hop's identity to this message.
+            IprevResult::None.as_auth_result(&mut self.auth_results);
+        } else {
+            iprev.result.as_auth_result(&mut self.auth_results);
+        }
         self.auth_results.push_str(" policy.iprev=");
         push_ip_as_pvalue(&mut self.auth_results, remote_ip);
     }

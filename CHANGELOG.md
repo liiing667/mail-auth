@@ -9,6 +9,7 @@ All notable changes to this project will be documented in this file. This projec
 - DKIM2: `Dkim2Signer::sign_streaming` returns a `Dkim2SigningStream`, which signs a message fed in chunks while buffering only its header section, as `DkimSigningStream` does for DKIM1 (#66).
 - `stream::MessageStream` parses a message fed in chunks into a `StreamedMessage`, which buffers only the header section and keeps the body as the hashes that DKIM, ARC and DKIM2 need. Its `message()` works with `verify_dkim`, `verify_arc`, `verify_dkim2`, DMARC and `ArcSealer::seal`; an operation that needs the body, or a hash the stream did not compute, fails with `Error::BodyNotAvailable` or `Dkim2Error::BodyNotAvailable` (#68).
 - DKIM2: `Dkim2Signer::sign_message` and `sign_revised_message` sign already parsed messages, including streamed ones (#68).
+- IPREV: `IprevEvaluation` (also `IprevTransaction`) is a resumable identity transaction. `verify_iprev_with` reuses it for retries, and `IprevOutput::report` exposes the client IP, PTR set, A/AAAA responses, cache generation, transaction generation and final result. `ResolverCache::generation` reports an optional cache generation.
 
 ### Changed
 - The `aws-lc-rs` feature no longer enables the operating system's certificate store for TLS resolvers; it moved to the new `rustls-platform-verifier` feature, enabled by default. Builds with `default-features = false` that use TLS resolvers must enable `rustls-platform-verifier` or `webpki-roots` (#65).
@@ -18,6 +19,7 @@ All notable changes to this project will be documented in this file. This projec
 - DKIM1: `DkimSigningStream` hashed the body from the first `\r\n\r\n` instead of where the header section ends, so a header line without a colon or a bare LF empty line produced a body hash that did not verify.
 - DKIM2: a verification proof was accepted as covering a message parsed with `prepend_headers` it was not made for, so `Dkim2Signer` signed it without a new `Message-Instance` and the chain failed at the next hop (#69).
 - SPF: the `ptr` mechanism did not match a PTR name equal to `<target-name>`, or a subdomain of a macro-expanded `<target-name>`, because the trailing dot of the PTR record or of the expanded name was compared (#71).
+- IPREV: a partial forward lookup failure could be followed by a match from a cached answer belonging to another SMTP hop, producing `iprev=pass` for the current message. The client IP, PTR set, A/AAAA answers and cache generation are now fixed by one identity transaction; a transient failure publishes no partial cache entries, and `AuthenticationResults` writes `iprev=none` rather than relabelling another client address's result.
 
 ## [0.15.1] - 2026-10-30
 

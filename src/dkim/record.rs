@@ -8,7 +8,8 @@
 //! record and the RFC 6541 ATPS record.
 
 use super::Canonicalization;
-use crate::crypto::{Algorithm, VerifyingKey};
+use crate::crypto::{Algorithm, CryptoError, VerifyingKey, VerifyingKeyType};
+use crate::Error;
 
 /// A DKIM1 public key record (RFC 6376, Section 3.6.1).
 ///
@@ -18,7 +19,22 @@ use crate::crypto::{Algorithm, VerifyingKey};
 /// type `k=`) and the `t=` flags.
 pub struct DomainKey {
     pub(crate) p: Box<dyn VerifyingKey + Send + Sync>,
+    pub(crate) p_type: VerifyingKeyType,
+    pub(crate) p_flags: u64,
     pub(crate) f: u64,
+    pub(crate) alternates: Vec<DomainKeyEntry>,
+}
+
+/// One additional key published at the same selector.
+///
+/// RFC 6376 Section 3.6.1 allows a TXT answer to carry more than one key
+/// record. Keeping every parsed record lets each signature select the key
+/// matching its `a=` algorithm instead of inheriting the first signature's
+/// choice.
+pub(crate) struct DomainKeyEntry {
+    pub(crate) key_type: VerifyingKeyType,
+    pub(crate) flags: u64,
+    pub(crate) key: Box<dyn VerifyingKey + Send + Sync>,
 }
 
 /// An RFC 6651 DKIM failure reporting record (RFC 6651, Section 3.3).
@@ -101,11 +117,28 @@ impl DomainKey {
         (self.f & R_FLAG_MATCH_DOMAIN) != 0
     }
 
-    /// Returns `true` when the name held more than one TXT record. DKIM uses
-    /// the first record that parses; DKIM2 treats this as an error
+    /// Returns `true` when the name held more than one TXT record. DKIM1 may
+    /// select a compatible record; DKIM2 treats this as an error
     /// (draft-ietf-dkim-dkim2-spec Section 14.5).
     pub fn has_multiple_records(&self) -> bool {
         (self.f & R_MULTIPLE_RECORDS) != 0
+    }
+
+    pub(crate) fn requires_strict_identity_for(&self, algorithm: Algorithm) -> bool {
+        (self.flags_for(algorithm) & R_FLAG_MATCH_DOMAIN) != 0
+    }
+
+    fn flags_for(&self, algorithm: Algorithm) -> u64 {
+        let mut flags = 0u64;
+        if self.p_type.supports(algorithm) {
+            flags |= self.p_flags;
+        }
+        for entry in &self.alternates {
+            if entry.key_type.supports(algorithm) {
+                flags |= entry.flags;
+            }
+        }
+        flags
     }
 
     pub(crate) fn verify<'a>(
@@ -114,12 +147,42 @@ impl DomainKey {
         input: &impl VerifySignature,
         canonicalization: Canonicalization,
     ) -> crate::Result<()> {
-        self.p.verify(
-            headers,
-            input.signature(),
-            canonicalization,
-            input.algorithm(),
-        )
+        if self.alternates.is_empty() {
+            return self.p.verify(
+                headers,
+                input.signature(),
+                canonicalization,
+                input.algorithm(),
+            );
+        }
+
+        let algorithm = input.algorithm();
+        let mut data = Vec::with_capacity(256);
+        canonicalization.canonicalize_headers(headers, &mut data);
+
+        let mut last_error = Error::Crypto(CryptoError::IncompatibleAlgorithms);
+        if self.p_type.supports(algorithm) {
+            match self
+                .p
+                .verify_bytes(&data, input.signature(), algorithm)
+            {
+                Ok(()) => return Ok(()),
+                Err(err) => last_error = err,
+            }
+        }
+        for entry in &self.alternates {
+            if entry.key_type.supports(algorithm) {
+                match entry
+                    .key
+                    .verify_bytes(&data, input.signature(), algorithm)
+                {
+                    Ok(()) => return Ok(()),
+                    Err(err) => last_error = err,
+                }
+            }
+        }
+
+        Err(last_error)
     }
 }
 

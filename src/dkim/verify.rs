@@ -7,8 +7,11 @@
 //! DKIM1 signature verification (RFC 6376, Section 6), including RFC 6541
 //! ATPS checks and RFC 6651 failure report address discovery.
 
-use crate::SystemTime;
-use crate::dns::DnsCache;
+use crate::dns::{
+    DnsCache, ResolverCache, ToFqdn, TxtRecord, TxtRecordParser, UnwrapTxtRecord,
+};
+use crate::headers::Header;
+use crate::{Instant, SystemTime};
 use crate::{
     AuthenticatedMessage, DkimOutput, DkimResult, Error, MessageAuthenticator, Parameters,
     dkim::{DomainKey, VerifySignature},
@@ -17,6 +20,7 @@ use crate::{
 };
 use crate::{DnsError, crypto::CryptoError};
 use encodify::base32;
+use std::sync::Mutex;
 
 use super::{
     AtpsRecord, DkimError, DkimReportRecord, HashAlgorithm, RR_DNS, RR_EXPIRATION, RR_OTHER,
@@ -40,10 +44,11 @@ impl MessageAuthenticator {
     /// to the domain of a `From` address, it also looks up the RFC 6541 ATPS
     /// record at `<d or base32(hash(d))>._atps.<atps>` ([`AtpsRecord`]); the
     /// result of that lookup becomes the result of the signature and
-    /// [`DkimOutput::is_atps`] is set. Finally, for every signature with `r=y`
-    /// that did not pass, it looks up the RFC 6651 report record at
-    /// `_report._domainkey.<d>` ([`DkimReportRecord`]) to fill
-    /// [`DkimOutput::report_address`].
+    /// [`DkimOutput::is_atps`] is set. For every signature with `r=y` that
+    /// did not pass, it looks up the RFC 6651 report record at
+    /// `_report._domainkey.<d>` ([`DkimReportRecord`]) while that signature is
+    /// being evaluated, so its [`DkimOutput::report_address`] is bound to the
+    /// same signature and key-record lookup.
     ///
     /// Result variants:
     ///
@@ -98,7 +103,8 @@ impl MessageAuthenticator {
     {
         let message = params.input;
         let mut output = Vec::with_capacity(message.dkim_headers.len() + message.errors.len());
-        let mut report_requested = false;
+        let txt_cache = params.txt_cache();
+        let staged = Mutex::new(Vec::new());
 
         for header in &message.errors {
             if let Error::Dkim(_) = &header.header {
@@ -108,185 +114,294 @@ impl MessageAuthenticator {
 
         for header in &message.dkim_headers {
             let signature = &header.header;
-            if signature.r {
-                report_requested = true;
+            let generation = txt_cache.map_or(0, |cache| cache.generation());
+            let cache = SignatureCache::new(txt_cache, generation, &staged);
+            let mut dkim = self
+                .verify_dkim_signature(message, header, now, &cache)
+                .await;
+
+            if signature.r && !matches!(&dkim.result, DkimResult::Pass) {
+                dkim.report = self
+                    .dkim_report_address(signature, &dkim.result, &cache)
+                    .await;
             }
 
-            if !(signature.x == 0 || (signature.x > signature.t && signature.x > now)) {
-                output.push(
-                    DkimOutput::neutral(Error::Dkim(DkimError::SignatureExpired))
-                        .with_signature(signature),
-                );
-                continue;
-            }
-
-            let ha = HashAlgorithm::from(signature.a);
-            let bh = &message
-                .body_hashes
-                .iter()
-                .find(|(c, h, l, _)| c == &signature.cb && h == &ha && l == &signature.l)
-                .unwrap()
-                .3;
-
-            if bh != &signature.bh {
-                output.push(
-                    DkimOutput::neutral(Error::Dkim(DkimError::BodyHashMismatch))
-                        .with_signature(signature),
-                );
-                continue;
-            }
-
-            let record = match self
-                .txt_lookup::<DomainKey>(signature.domain_key(), params.txt_cache())
-                .await
-            {
-                Ok(record) => record,
-                Err(err) => {
-                    output.push(DkimOutput::dns_error(err).with_signature(signature));
-                    continue;
-                }
-            };
-
-            if !signature.validate_auid(&record) {
-                output.push(
-                    DkimOutput::fail(Error::Dkim(DkimError::AuidMismatch))
-                        .with_signature(signature),
-                );
-                continue;
-            }
-
-            let dkim_hdr_value = header.value.strip_signature();
-            let mut headers = message.signed_headers(&signature.h, header.name, &dkim_hdr_value);
-
-            if let Err(err) = record.verify(&mut headers, signature, signature.ch) {
-                output.push(DkimOutput::fail(err).with_signature(signature));
-                continue;
-            }
-
-            if let Some(atps) = &signature.atps {
-                let mut found = false;
-                for from in &message.from {
-                    if let Some((_, domain)) = from.rsplit_once('@')
-                        && domain.eq(atps)
-                    {
-                        found = true;
-                        break;
-                    }
-                }
-
-                if found {
-                    let mut query_domain = match &signature.atpsh {
-                        Some(algorithm) => {
-                            base32::STANDARD_NO_PAD.encode(algorithm.hash(signature.d.as_bytes()))
-                        }
-                        None => signature.d.to_string(),
-                    };
-                    query_domain.push_str("._atps.");
-                    query_domain.push_str(atps);
-                    query_domain.push('.');
-
-                    match self
-                        .txt_lookup::<AtpsRecord>(query_domain, params.txt_cache())
-                        .await
-                    {
-                        Ok(_) => {
-                            output.push(DkimOutput::pass().with_atps().with_signature(signature));
-                        }
-                        Err(err) => {
-                            output.push(
-                                DkimOutput::dns_error(err)
-                                    .with_atps()
-                                    .with_signature(signature),
-                            );
-                        }
-                    }
-                    continue;
-                }
-            }
-
-            output.push(DkimOutput::pass().with_signature(signature));
+            output.push(dkim);
         }
 
-        if report_requested {
-            for dkim in &mut output {
-                let signature = if let Some(signature) = &dkim.signature {
-                    if signature.r && dkim.result != DkimResult::Pass {
-                        signature
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                };
+        let generation = txt_cache.map_or(0, |cache| cache.generation());
+        SignatureCache::new(txt_cache, generation, &staged).commit();
+        output
+    }
 
-                let record = if let Ok(record) = self
-                    .txt_lookup::<DkimReportRecord>(
-                        format!("_report._domainkey.{}.", signature.d),
-                        params.txt_cache(),
-                    )
+    async fn verify_dkim_signature<'x, C>(
+        &self,
+        message: &'x AuthenticatedMessage<'x>,
+        header: &'x Header<'x, Signature>,
+        now: u64,
+        cache: &SignatureCache<'_, C>,
+    ) -> DkimOutput<'x>
+    where
+        C: ResolverCache<Box<str>, TxtRecord>,
+    {
+        let signature = &header.header;
+
+        if !(signature.x == 0 || (signature.x > signature.t && signature.x > now)) {
+            return DkimOutput::neutral(Error::Dkim(DkimError::SignatureExpired))
+                .with_signature(signature);
+        }
+
+        let ha = HashAlgorithm::from(signature.a);
+        let bh = &message
+            .body_hashes
+            .iter()
+            .find(|(c, h, l, _)| c == &signature.cb && h == &ha && l == &signature.l)
+            .expect("body hash must exist for every parsed signature")
+            .3;
+
+        if bh != &signature.bh {
+            return DkimOutput::neutral(Error::Dkim(DkimError::BodyHashMismatch))
+                .with_signature(signature);
+        }
+
+        let record = match self
+            .dkim_txt_lookup::<DomainKey, C>(signature.domain_key(), cache)
+            .await
+        {
+            Ok(record) => record,
+            Err(err) => return DkimOutput::dns_error(err).with_signature(signature),
+        };
+
+        if !signature.validate_auid(&record) {
+            return DkimOutput::fail(Error::Dkim(DkimError::AuidMismatch))
+                .with_signature(signature);
+        }
+
+        let dkim_hdr_value = header.value.strip_signature();
+        let mut headers = message.signed_headers(&signature.h, header.name, &dkim_hdr_value);
+
+        if let Err(err) = record.verify(&mut headers, signature, signature.ch) {
+            return DkimOutput::fail(err).with_signature(signature);
+        }
+
+        if let Some(atps) = &signature.atps {
+            let mut found = false;
+            for from in &message.from {
+                if let Some((_, domain)) = from.rsplit_once('@')
+                    && domain.eq(atps)
+                {
+                    found = true;
+                    break;
+                }
+            }
+
+            if found {
+                let mut query_domain = match &signature.atpsh {
+                    Some(algorithm) => {
+                        base32::STANDARD_NO_PAD.encode(algorithm.hash(signature.d.as_bytes()))
+                    }
+                    None => signature.d.to_string(),
+                };
+                query_domain.push_str("._atps.");
+                query_domain.push_str(atps);
+                query_domain.push('.');
+
+                return match self
+                    .dkim_txt_lookup::<AtpsRecord, C>(query_domain, cache)
                     .await
                 {
-                    if is_within_pct(record.rp) {
-                        record
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                };
-
-                dkim.report = match &dkim.result() {
-                    DkimResult::Neutral(err)
-                    | DkimResult::Fail(err)
-                    | DkimResult::PermError(err)
-                    | DkimResult::TempError(err) => {
-                        let send_report = match err {
-                            Error::Crypto(CryptoError::Library(_))
-                            | Error::Crypto(CryptoError::MalformedPublicKey)
-                            | Error::Io(_)
-                            | Error::Crypto(CryptoError::FailedVerification)
-                            | Error::Dkim(DkimError::BodyHashMismatch)
-                            | Error::Dkim(DkimError::AuidMismatch) => {
-                                (record.rr & RR_VERIFICATION) != 0
-                            }
-                            Error::Base64
-                            | Error::Dkim(DkimError::UnsupportedVersion)
-                            | Error::Dkim(DkimError::UnsupportedAlgorithm)
-                            | Error::Dkim(DkimError::UnsupportedCanonicalization)
-                            | Error::Dkim(DkimError::UnsupportedKeyType)
-                            | Error::Crypto(CryptoError::IncompatibleAlgorithms) => {
-                                (record.rr & RR_SIGNATURE) != 0
-                            }
-                            Error::Dkim(DkimError::SignatureExpired) => {
-                                (record.rr & RR_EXPIRATION) != 0
-                            }
-                            Error::Dns(DnsError::Resolver(_))
-                            | Error::Dns(DnsError::RecordNotFound(_))
-                            | Error::Dns(DnsError::InvalidRecordType)
-                            | Error::Parse
-                            | Error::Dkim(DkimError::PublicKeyRevoked) => (record.rr & RR_DNS) != 0,
-                            #[cfg(feature = "arc")]
-                            Error::Arc(_) => (record.rr & RR_OTHER) != 0,
-                            Error::MissingParameters
-                            | Error::BodyNotAvailable
-                            | Error::NoHeadersFound
-                            | Error::Dkim(DkimError::BodyLengthTag)
-                            | Error::NotAligned
-                            | Error::Dkim2(_) => (record.rr & RR_OTHER) != 0,
-                        };
-
-                        if send_report {
-                            format!("{}@{}", record.ra, signature.d).into()
-                        } else {
-                            None
-                        }
-                    }
-                    DkimResult::None | DkimResult::Pass => None,
+                    Ok(_) => DkimOutput::pass().with_atps().with_signature(signature),
+                    Err(err) => DkimOutput::dns_error(err)
+                        .with_atps()
+                        .with_signature(signature),
                 };
             }
         }
 
-        output
+        DkimOutput::pass().with_signature(signature)
+    }
+
+    async fn dkim_txt_lookup<T, C>(
+        &self,
+        key: impl Into<String>,
+        cache: &SignatureCache<'_, C>,
+    ) -> crate::Result<std::sync::Arc<T>>
+    where
+        T: TxtRecordParser + Into<TxtRecord> + UnwrapTxtRecord,
+        C: ResolverCache<Box<str>, TxtRecord>,
+    {
+        let key = key.into().to_fqdn().into_owned();
+        if cache.shared.is_none() {
+            self.txt_lookup::<T>(key, None).await
+        } else {
+            self.txt_lookup::<T>(key, Some(cache)).await
+        }
+    }
+
+    async fn dkim_report_address<C>(
+        &self,
+        signature: &Signature,
+        result: &DkimResult,
+        cache: &SignatureCache<'_, C>,
+    ) -> Option<String>
+    where
+        C: ResolverCache<Box<str>, TxtRecord>,
+    {
+        if !signature.r {
+            return None;
+        }
+
+        let record = self
+            .dkim_txt_lookup::<DkimReportRecord, C>(
+                format!("_report._domainkey.{}.", signature.d),
+                cache,
+            )
+            .await
+            .ok()?;
+
+        if !is_within_pct(record.rp) {
+            return None;
+        }
+
+        let send_report = match result {
+            DkimResult::Neutral(err)
+            | DkimResult::Fail(err)
+            | DkimResult::PermError(err)
+            | DkimResult::TempError(err) => match err {
+                Error::Crypto(CryptoError::Library(_))
+                | Error::Crypto(CryptoError::MalformedPublicKey)
+                | Error::Io(_)
+                | Error::Crypto(CryptoError::FailedVerification)
+                | Error::Dkim(DkimError::BodyHashMismatch)
+                | Error::Dkim(DkimError::AuidMismatch) => (record.rr & RR_VERIFICATION) != 0,
+                Error::Base64
+                | Error::Dkim(DkimError::UnsupportedVersion)
+                | Error::Dkim(DkimError::UnsupportedAlgorithm)
+                | Error::Dkim(DkimError::UnsupportedCanonicalization)
+                | Error::Dkim(DkimError::UnsupportedKeyType)
+                | Error::Crypto(CryptoError::IncompatibleAlgorithms) => {
+                    (record.rr & RR_SIGNATURE) != 0
+                }
+                Error::Dkim(DkimError::SignatureExpired) => (record.rr & RR_EXPIRATION) != 0,
+                Error::Dns(DnsError::Resolver(_))
+                | Error::Dns(DnsError::RecordNotFound(_))
+                | Error::Dns(DnsError::InvalidRecordType)
+                | Error::Parse
+                | Error::Dkim(DkimError::PublicKeyRevoked) => (record.rr & RR_DNS) != 0,
+                #[cfg(feature = "arc")]
+                Error::Arc(_) => (record.rr & RR_OTHER) != 0,
+                Error::MissingParameters
+                | Error::BodyNotAvailable
+                | Error::NoHeadersFound
+                | Error::Dkim(DkimError::BodyLengthTag)
+                | Error::NotAligned
+                | Error::Dkim2(_) => (record.rr & RR_OTHER) != 0,
+            },
+            DkimResult::None | DkimResult::Pass => return None,
+        };
+
+        send_report.then(|| format!("{}@{}", record.ra, signature.d))
+    }
+}
+
+/// A per-signature view of the shared TXT cache.
+///
+/// Reads only see entries that were already in the shared cache with the same
+/// generation. Writes are staged with the signature's generation and published
+/// once every signature has been evaluated. A key or report fetched for one
+/// signature therefore cannot leak into another signature, while a cache
+/// populated before the call is still shared by all signatures as usual.
+struct SignatureCache<'a, C> {
+    shared: Option<&'a C>,
+    generation: u64,
+    staged: &'a Mutex<Vec<(u64, Box<str>, TxtRecord, Instant)>>,
+}
+
+impl<'a, C> SignatureCache<'a, C>
+where
+    C: ResolverCache<Box<str>, TxtRecord>,
+{
+    fn new(
+        shared: Option<&'a C>,
+        generation: u64,
+        staged: &'a Mutex<Vec<(u64, Box<str>, TxtRecord, Instant)>>,
+    ) -> Self {
+        SignatureCache {
+            shared,
+            generation,
+            staged,
+        }
+    }
+
+    fn commit(&self) {
+        let staged = {
+            let mut staged = self
+                .staged
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *staged)
+        };
+        if let Some(shared) = self.shared {
+            let current = shared.generation();
+            let mut published: Vec<Box<str>> = Vec::new();
+            for (generation, key, value, valid_until) in staged.into_iter().rev() {
+                if current != 0 && generation != current {
+                    // This answer belongs to a cache generation that has
+                    // since been replaced.
+                    continue;
+                }
+                if published.iter().any(|seen| seen == &key) {
+                    continue;
+                }
+                // On a generation-tracking cache the staged answer belongs to
+                // the current generation and replaces any stale entry. When
+                // the cache does not track generations, do not overwrite a
+                // value that another writer may have refreshed meanwhile.
+                if current != 0 || shared.get::<str>(&key).is_none() {
+                    published.push(key.clone());
+                    shared.insert(key, value, valid_until);
+                }
+            }
+        }
+    }
+}
+
+impl<C> ResolverCache<Box<str>, TxtRecord> for SignatureCache<'_, C>
+where
+    C: ResolverCache<Box<str>, TxtRecord>,
+{
+    fn get<Q>(&self, name: &Q) -> Option<TxtRecord>
+    where
+        Box<str>: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let shared = self.shared?;
+        let current = shared.generation();
+        if current != 0 && current != self.generation {
+            return None;
+        }
+        shared.get(name)
+    }
+
+    fn remove<Q>(&self, key: &Q) -> Option<TxtRecord>
+    where
+        Box<str>: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let shared = self.shared?;
+        let current = shared.generation();
+        if current == 0 || current == self.generation {
+            shared.remove(key)
+        } else {
+            None
+        }
+    }
+
+    fn insert(&self, key: Box<str>, value: TxtRecord, valid_until: Instant) {
+        self.staged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((self.generation, key, value, valid_until));
     }
 }
 
@@ -373,7 +488,8 @@ impl Signature {
             .and_then(|split| auid_domain.split_at_checked(split))
         {
             Some((parent, suffix)) if suffix.eq_ignore_ascii_case(domain) => {
-                parent.is_empty() || (!record.requires_strict_identity() && parent.ends_with(b"."))
+                parent.is_empty()
+                    || (!record.requires_strict_identity_for(self.a) && parent.ends_with(b"."))
             }
             _ => false,
         }

@@ -110,7 +110,13 @@ impl HeapSize for DmarcRecord {
 
 impl HeapSize for DomainKey {
     fn heap_size(&self) -> usize {
-        size_of_val(self.p.as_ref()) + self.p.heap_size()
+        size_of_val(self.p.as_ref())
+            + self.p.heap_size()
+            + self
+                .alternates
+                .iter()
+                .map(|entry| size_of_val(entry.key.as_ref()) + entry.key.heap_size())
+                .sum::<usize>()
     }
 }
 

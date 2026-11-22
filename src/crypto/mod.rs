@@ -231,6 +231,7 @@ pub trait VerifyingKey {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VerifyingKeyType {
     Rsa,
     Ed25519,
@@ -238,6 +239,15 @@ pub(crate) enum VerifyingKeyType {
 }
 
 impl VerifyingKeyType {
+    pub(crate) fn supports(&self, algorithm: Algorithm) -> bool {
+        matches!(
+            (*self, algorithm),
+            (Self::Rsa, Algorithm::RsaSha256 | Algorithm::RsaSha1)
+                | (Self::Ed25519, Algorithm::Ed25519Sha256)
+                | (Self::MlDsa44, Algorithm::MlDsa44)
+        )
+    }
+
     pub(crate) fn verifying_key(
         &self,
         bytes: &[u8],

@@ -11,6 +11,7 @@ use super::{
     Algorithm, AtpsRecord, Canonicalization, DkimError, DkimReportRecord, Flag, HashAlgorithm,
     RR_DNS, RR_OTHER, RR_POLICY, Service, Signature,
 };
+use super::record::DomainKeyEntry;
 use crate::DnsError;
 use crate::{
     Error,
@@ -310,24 +311,39 @@ impl TxtRecordParser for DomainKey {
             }
             Some(public_key) => Ok(DomainKey {
                 p: key_type.verifying_key(&public_key)?,
+                p_type: key_type,
+                p_flags: flags,
                 f: flags,
+                alternates: Vec::new(),
             }),
             _ => Err(Error::Dns(DnsError::InvalidRecordType)),
         }
     }
 
     fn parse_records(records: &[Vec<u8>]) -> crate::Result<Self> {
-        let mut result = Err(Error::Dns(DnsError::InvalidRecordType));
+        let mut last_error = Error::Dns(DnsError::InvalidRecordType);
+        let mut parsed = Vec::with_capacity(records.len());
         for record in records {
-            result = Self::parse(record);
-            if let Ok(key) = &mut result {
-                if records.len() > 1 {
-                    key.f |= R_MULTIPLE_RECORDS;
-                }
-                break;
+            match Self::parse(record) {
+                Ok(key) => parsed.push(key),
+                Err(err) => last_error = err,
             }
         }
-        result
+
+        let mut parsed = parsed.into_iter();
+        let mut key = parsed.next().ok_or(last_error)?;
+        if records.len() > 1 {
+            key.f |= R_MULTIPLE_RECORDS;
+        }
+        for alternate in parsed {
+            key.f |= alternate.f;
+            key.alternates.push(DomainKeyEntry {
+                key_type: alternate.p_type,
+                flags: alternate.p_flags,
+                key: alternate.p,
+            });
+        }
+        Ok(key)
     }
 }
 

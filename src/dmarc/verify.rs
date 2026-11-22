@@ -5,8 +5,9 @@
  */
 
 use super::{Alignment, DmarcRecord, Policy, Psd};
+use crate::Instant;
 use crate::DnsError;
-use crate::dns::{DnsCache, Negative};
+use crate::dns::{DnsCache, Negative, TxtRecord as TxtRecordEnum};
 use crate::{
     AuthenticatedMessage, Dkim2Result, DkimOutput, DkimResult, DmarcOutput, DmarcResult, Error,
     MessageAuthenticator, Parameters, RecordSet, ResolverCache, SpfOutput, SpfResult, TxtRecord,
@@ -14,7 +15,11 @@ use crate::{
     dns::cache::NoCache,
     dns::to_a_label,
 };
-use std::{borrow::Cow, net::Ipv4Addr, sync::Arc};
+use std::{
+    borrow::Cow,
+    net::Ipv4Addr,
+    sync::Arc,
+};
 
 const DMARC_PREFIX: &str = "_dmarc.";
 const REPORT_PREFIX: &str = "._report._dmarc.";
@@ -143,7 +148,11 @@ impl MessageAuthenticator {
         }
         let rfc5322_from_domain = rfc5322_from_domain.as_ref();
 
-        let walk = match self.dmarc_tree_walk(rfc5322_from_domain, cache_txt).await {
+        let mut discovery = DmarcDiscovery::new(cache_txt);
+        let walk = match self
+            .dmarc_tree_walk(rfc5322_from_domain, &mut discovery)
+            .await
+        {
             Ok(walk) => walk,
             Err(err) => {
                 let err = DmarcResult::from(err);
@@ -244,7 +253,7 @@ impl MessageAuthenticator {
                     rfc5322_from_domain,
                     author_org,
                     aspf,
-                    cache_txt,
+                    &mut discovery,
                     &mut org_memo,
                 )
                 .await
@@ -270,7 +279,7 @@ impl MessageAuthenticator {
                     rfc5322_from_domain,
                     author_org,
                     adkim,
-                    cache_txt,
+                    &mut discovery,
                     &mut org_memo,
                 )
                 .await
@@ -388,17 +397,32 @@ impl MessageAuthenticator {
     /// Performs a DNS Tree Walk (RFC 9989 Section 4.10) starting at `domain`
     /// and returns every valid DMARC Policy Record found from the starting
     /// point (longest name) up to the top-level domain (shortest name).
-    async fn dmarc_tree_walk<'x>(
+    ///
+    /// The walk runs as one discovery transaction: every answer consulted
+    /// (cache hits and fresh queries, positive and cacheable negative
+    /// answers alike) is first staged in [`DmarcDiscovery`]'s private
+    /// snapshot. Only a walk that finishes without a transient resolver
+    /// error commits the snapshot to the shared cache; a failed walk
+    /// discards it, so a retry can never combine ancestor records left over
+    /// from a previous, differently-shaped walk (for example one with a
+    /// different PSD stop point) with records fetched in the new attempt.
+    async fn dmarc_tree_walk<'x, C>(
         &self,
         domain: &'x str,
-        txt_cache: Option<&impl ResolverCache<Box<str>, TxtRecord>>,
-    ) -> crate::Result<Vec<(&'x str, Arc<DmarcRecord>)>> {
+        discovery: &mut DmarcDiscovery<'_, C>,
+    ) -> crate::Result<Vec<(&'x str, Arc<DmarcRecord>)>>
+    where
+        C: ResolverCache<Box<str>, TxtRecord>,
+    {
         let total = domain.split('.').filter(|l| !l.is_empty()).count();
         let mut found = Vec::new();
         if total < 2 {
             return Ok(found);
         }
 
+        // Every lookup of this walk is staged behind a transaction-local
+        // write gate and only committed to the shared cache once the whole
+        // walk succeeds (see `DmarcDiscovery::commit`).
         let mut count = total;
         let mut key = String::with_capacity(domain.len() + DMARC_PREFIX.len() + 1);
         loop {
@@ -407,7 +431,8 @@ impl MessageAuthenticator {
             key.push_str(DMARC_PREFIX);
             key.push_str(name);
             key.push('.');
-            match self.txt_lookup::<DmarcRecord>(&key, txt_cache).await {
+            let gate = discovery.gate();
+            match self.txt_lookup::<DmarcRecord>(&key, Some(&gate)).await {
                 Ok(dmarc) => {
                     let stop = matches!(dmarc.psd, Psd::Yes | Psd::No);
                     found.push((name, dmarc));
@@ -417,7 +442,13 @@ impl MessageAuthenticator {
                 }
                 Err(Error::Dns(DnsError::RecordNotFound(_)))
                 | Err(Error::Dns(DnsError::InvalidRecordType)) => (),
-                Err(err) => return Err(err),
+                Err(err) => {
+                    // Transient failure: drop the whole snapshot so the
+                    // partially discovered ancestor chain cannot reach the
+                    // shared cache and contaminate a later retry.
+                    debug_assert!(matches!(err, Error::Dns(DnsError::Resolver(_))));
+                    return Err(err);
+                }
             }
 
             if count == 1 {
@@ -426,6 +457,7 @@ impl MessageAuthenticator {
             count = if count >= 8 { 7 } else { count - 1 };
         }
 
+        discovery.commit();
         Ok(found)
     }
 
@@ -444,43 +476,166 @@ impl MessageAuthenticator {
         }
     }
 
-    async fn is_aligned<'x>(
+    async fn is_aligned<'x, C>(
         &self,
         domain: &'x str,
         author_domain: &'x str,
         author_org: &'x str,
         alignment: Alignment,
-        txt_cache: Option<&impl ResolverCache<Box<str>, TxtRecord>>,
+        discovery: &mut DmarcDiscovery<'_, C>,
         memo: &mut Vec<(&'x str, &'x str)>,
-    ) -> crate::Result<bool> {
+    ) -> crate::Result<bool>
+    where
+        C: ResolverCache<Box<str>, TxtRecord>,
+    {
         Ok(domain == author_domain
             || (alignment == Alignment::Relaxed
                 && domain
                     .strip_suffix(author_org)
                     .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('.'))
                 && self
-                    .organizational_domain_of(domain, txt_cache, memo)
+                    .organizational_domain_of(domain, discovery, memo)
                     .await?
                     == author_org))
     }
 
     /// Determines the Organizational Domain of `domain` via a DNS Tree Walk (RFC 9989 Section 4.10.2).
-    async fn organizational_domain_of<'x>(
+    async fn organizational_domain_of<'x, C>(
         &self,
         domain: &'x str,
-        txt_cache: Option<&impl ResolverCache<Box<str>, TxtRecord>>,
+        discovery: &mut DmarcDiscovery<'_, C>,
         memo: &mut Vec<(&'x str, &'x str)>,
-    ) -> crate::Result<&'x str> {
+    ) -> crate::Result<&'x str>
+    where
+        C: ResolverCache<Box<str>, TxtRecord>,
+    {
         if let Some(&(_, org)) = memo.iter().find(|(d, _)| *d == domain) {
             return Ok(org);
         }
-        let org = match self.dmarc_tree_walk(domain, txt_cache).await {
+        let org = match self.dmarc_tree_walk(domain, discovery).await {
             Ok(walk) => organizational_domain(&walk, domain).unwrap_or(domain),
             Err(err @ Error::Dns(DnsError::Resolver(_))) => return Err(err),
             Err(_) => domain,
         };
         memo.push((domain, org));
         Ok(org)
+    }
+}
+
+/// Transactional context for one DMARC verification's policy discovery.
+///
+/// A [`MessageAuthenticator::verify_dmarc`] call performs one DNS Tree Walk
+/// for the Author Domain and, under relaxed alignment, further walks for the
+/// SPF and DKIM identifiers. Each walk stages the answers it consults in a
+/// private snapshot and only publishes them to the shared TXT cache after
+/// completing successfully, so all the records feeding one policy
+/// decision—the Author Domain, the uninterrupted ancestor chain, the PSD
+/// stop point and the resulting policy—are observed as one atomic discovery
+/// transaction.
+///
+/// A walk that aborts on a transient resolver error publishes nothing, so a
+/// later retry cannot combine ancestor records left over from a previous,
+/// differently-shaped walk (for example one with a different PSD stop
+/// point) with records fetched in the new attempt. Entries committed by an
+/// earlier successful walk of the same verification remain visible to later
+/// walks, preserving ordinary caching for transactions that never saw a
+/// transient error.
+struct DmarcDiscovery<'a, C> {
+    cache: Option<&'a C>,
+    staged: Vec<(Box<str>, TxtRecordEnum, Instant)>,
+}
+
+impl<'a, C: ResolverCache<Box<str>, TxtRecord>> DmarcDiscovery<'a, C> {
+    fn new(cache: Option<&'a C>) -> Self {
+        DmarcDiscovery {
+            cache,
+            staged: Vec::new(),
+        }
+    }
+
+    /// Wraps the shared cache in a per-walk write gate. Reads still reach the
+    /// shared cache and the entries staged by earlier successful walks, but
+    /// writes produced during this walk are buffered until [`commit`].
+    ///
+    /// [`commit`]: Self::commit
+    fn gate(&mut self) -> TxCache<'_, C> {
+        TxCache {
+            shared: self.cache,
+            staged: &mut self.staged,
+        }
+    }
+
+    /// Publishes every entry staged by the just-completed walk to the shared
+    /// cache, preserving the TTL derived from each DNS answer. Entries
+    /// already present (for example from an earlier walk of the same
+    /// verification) keep their existing value and TTL.
+    fn commit(&mut self) {
+        if let Some(cache) = self.cache {
+            for (key, value, valid_until) in self.staged.drain(..) {
+                if cache.get::<str>(&key).is_none() {
+                    cache.insert(key, value, valid_until);
+                }
+            }
+        } else {
+            self.staged.clear();
+        }
+    }
+}
+
+/// A write-gated view of the shared TXT cache used by one tree walk.
+///
+/// It implements [`ResolverCache`], so the unmodified
+/// [`txt_lookup`](MessageAuthenticator::txt_lookup) helper performs the
+/// parsing and the TTL calculation. Reads fall through to the shared cache;
+/// writes are appended to the owning [`DmarcDiscovery`]'s staging buffer
+/// instead of touching the shared cache.
+struct TxCache<'a, C> {
+    shared: Option<&'a C>,
+    staged: &'a mut Vec<(Box<str>, TxtRecordEnum, Instant)>,
+}
+
+impl<C: ResolverCache<Box<str>, TxtRecord>> ResolverCache<Box<str>, TxtRecord> for TxCache<'_, C> {
+    fn get<Q>(&self, name: &Q) -> Option<TxtRecord>
+    where
+        Box<str>: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        if let Some((_, value, _)) = self
+            .staged
+            .iter()
+            .rev()
+            .find(|(key, _, _)| {
+                let key_as_q: &Q = key.borrow();
+                key_as_q == name
+            })
+        {
+            return Some(value.clone());
+        }
+        self.shared.and_then(|cache| cache.get(name))
+    }
+
+    fn remove<Q>(&self, _name: &Q) -> Option<TxtRecord>
+    where
+        Box<str>: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        // Removal is never used by the lookup helpers; a transaction only
+        // ever inserts, and must not mutate the shared cache before commit.
+        None
+    }
+
+    fn insert(&self, key: Box<str>, value: TxtRecord, valid_until: Instant) {
+        // A walk queries each ancestor at most once, but keep one entry per
+        // key anyway so the staged view matches ordinary cache semantics.
+        if let Some(entry) = self
+            .staged
+            .iter_mut()
+            .find(|(staged_key, _, _)| staged_key.as_ref() == key.as_ref())
+        {
+            *entry = (key, value, valid_until);
+        } else {
+            self.staged.push((key, value, valid_until));
+        }
     }
 }
 

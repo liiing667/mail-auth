@@ -7,7 +7,7 @@
 use super::DmarcParameters;
 use crate::{
     AuthenticatedMessage, DkimOutput, DkimResult, DmarcResult, DnsError, Error,
-    MessageAuthenticator, SpfOutput, SpfResult,
+    MessageAuthenticator, ResolverCache, SpfOutput, SpfResult, TxtRecord,
     dkim::{DkimError, Signature},
     dmarc::{DmarcRecord, Policy, Uri},
     dns::cache::test::DummyCaches,
@@ -606,4 +606,228 @@ async fn dmarc_alignment_is_case_insensitive() {
 
     let result = verify_aligned(&resolver, &caches, "hello@example.org", "EXAMPLE.ORG").await;
     assert_eq!(result.spf_result(), &DmarcResult::Pass);
+}
+
+// A TXT cache for the transaction tests. It holds records that stand in for
+// cached DNS answers, records every write the discovery layer commits, and
+// can hide chosen entries so the lookup falls through to the mock resolver
+// (which answers names containing `_dns_error.` with a transient failure).
+#[derive(Default)]
+struct TransactionCache {
+    records: std::sync::Mutex<std::collections::HashMap<Box<str>, TxtRecord>>,
+    hidden: std::sync::Mutex<std::collections::HashSet<Box<str>>>,
+    inserts: std::sync::Mutex<Vec<Box<str>>>,
+}
+
+impl TransactionCache {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn seed(&self, name: &str, record: &str) {
+        self.records.lock().unwrap().insert(
+            name.into(),
+            DmarcRecord::parse(record.as_bytes()).unwrap().into(),
+        );
+    }
+
+    fn replace(&self, name: &str, record: &str) {
+        self.seed(name, record);
+    }
+
+    fn hide(&self, name: &str) {
+        self.hidden.lock().unwrap().insert(name.into());
+    }
+
+    fn show_all(&self) {
+        self.hidden.lock().unwrap().clear();
+    }
+
+    fn committed(&self) -> Vec<Box<str>> {
+        self.inserts.lock().unwrap().clone()
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.records.lock().unwrap().contains_key(name)
+    }
+}
+
+impl ResolverCache<Box<str>, TxtRecord> for TransactionCache {
+    fn get<Q>(&self, name: &Q) -> Option<TxtRecord>
+    where
+        Box<str>: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        let records = self.records.lock().unwrap();
+        let hidden = self.hidden.lock().unwrap();
+        records.iter().find_map(|(key, value)| {
+            let key_as_q: &Q = key.borrow();
+            (key_as_q == name && !hidden.contains::<str>(key.as_ref()))
+                .then(|| value.clone())
+        })
+    }
+
+    fn remove<Q>(&self, _name: &Q) -> Option<TxtRecord>
+    where
+        Box<str>: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        None
+    }
+
+    fn insert(&self, key: Box<str>, value: TxtRecord, _valid_until: Instant) {
+        self.records.lock().unwrap().insert(key.clone(), value);
+        self.inserts.lock().unwrap().push(key);
+    }
+}
+
+// A transient failure halfway through a tree walk must not publish any of
+// the ancestor answers consulted before the failure: the whole discovery
+// transaction is discarded, so a retry starts from a clean shared cache.
+#[tokio::test]
+async fn dmarc_walk_transient_error_discards_the_transaction() {
+    use super::DmarcDiscovery;
+
+    let resolver = MessageAuthenticator::new_system_conf().unwrap();
+    let cache = TransactionCache::new();
+
+    // The two deepest names resolve from the cache; the next ancestor is a
+    // `_dns_error.` name the mock resolver fails transiently. It is cached
+    // at first but hidden, so the walk reaches the failing query.
+    cache.seed(
+        "_dmarc.b.mail._dns_error.example.com.",
+        "v=DMARC1; p=none; sp=none; rua=mailto:d@example.com",
+    );
+    cache.seed(
+        "_dmarc.mail._dns_error.example.com.",
+        "v=DMARC1; p=none; sp=none; rua=mailto:d@example.com",
+    );
+    cache.hide("_dmarc.mail._dns_error.example.com.");
+
+    let mut discovery = DmarcDiscovery::new(Some(&cache));
+    let err = resolver
+        .dmarc_tree_walk("a.b.mail._dns_error.example.com", &mut discovery)
+        .await
+        .expect_err("the walk must surface the transient resolver error");
+    assert!(matches!(err, Error::Dns(DnsError::Resolver(_))));
+
+    // Nothing from the aborted transaction was committed to the shared
+    // cache: it still holds only the two records seeded before the walk,
+    // and no negative/positive entry was written for the names the walk
+    // consulted, which only lived in the discarded transaction snapshot.
+    assert_eq!(cache.committed(), Vec::<Box<str>>::new());
+    assert!(!cache.contains("_dmarc.a.b.mail._dns_error.example.com."));
+
+    // Once the transient condition clears, the retry completes as one
+    // coherent transaction, stopping at the psd=n record.
+    cache.show_all();
+    cache.seed(
+        "_dmarc._dns_error.example.com.",
+        "v=DMARC1; p=reject; psd=n; rua=mailto:d@example.com",
+    );
+    let mut discovery = DmarcDiscovery::new(Some(&cache));
+    let walk = resolver
+        .dmarc_tree_walk("a.b.mail._dns_error.example.com", &mut discovery)
+        .await
+        .expect("the retry must complete");
+    let names: Vec<&str> = walk.iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        names,
+        vec![
+            "b.mail._dns_error.example.com",
+            "mail._dns_error.example.com",
+            "_dns_error.example.com"
+        ]
+    );
+    assert_eq!(walk.last().unwrap().1.p, Policy::Reject);
+}
+
+// When a retry observes a changed PSD stop point, the walk must be built
+// entirely from answers of one discovery transaction. Records of an older,
+// differently-shaped walk can never be stitched together with new records
+// into a mixed policy tree.
+#[tokio::test]
+async fn dmarc_walk_retry_never_mixes_two_policy_trees() {
+    use super::DmarcDiscovery;
+
+    let resolver = MessageAuthenticator::new_system_conf().unwrap();
+
+    // Old DNS layout: the PSD stop point sits at bank.example.
+    let old = TransactionCache::new();
+    old.seed(
+        "_dmarc.bank.example.",
+        "v=DMARC1; p=reject; psd=y; rua=mailto:d@bank.example",
+    );
+    old.seed(
+        "_dmarc.giant.bank.example.",
+        "v=DMARC1; p=reject; rua=mailto:d@giant.bank.example",
+    );
+    let mut discovery = DmarcDiscovery::new(Some(&old));
+    let walk = resolver
+        .dmarc_tree_walk("mega.giant.bank.example", &mut discovery)
+        .await
+        .unwrap();
+    assert_eq!(
+        walk.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        vec!["giant.bank.example", "bank.example"]
+    );
+
+    // New DNS layout: the PSD stop point moved one label up to example,
+    // bank.example lost psd=y, and every policy changed to none.
+    let new = TransactionCache::new();
+    new.seed(
+        "_dmarc.example.",
+        "v=DMARC1; p=none; psd=y; rua=mailto:d@example",
+    );
+    new.replace(
+        "_dmarc.bank.example.",
+        "v=DMARC1; p=none; rua=mailto:d@bank.example",
+    );
+    new.seed(
+        "_dmarc.giant.bank.example.",
+        "v=DMARC1; p=none; rua=mailto:d@giant.bank.example",
+    );
+    let mut discovery = DmarcDiscovery::new(Some(&new));
+    let walk = resolver
+        .dmarc_tree_walk("mega.giant.bank.example", &mut discovery)
+        .await
+        .unwrap();
+    assert_eq!(
+        walk.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        vec!["giant.bank.example", "bank.example", "example."]
+    );
+    // The whole new chain carries the new policy; no reject (old tree)
+    // record survived into the new discovery.
+    assert!(walk.iter().all(|(_, record)| record.p == Policy::None));
+}
+
+// A successful transaction keeps the legal no-record semantics (a missing
+// DMARC record contributes no policy entry and is cached as a negative), and
+// leaves psd, sp/np, rua and IDN (A-label) handling untouched.
+#[tokio::test]
+async fn dmarc_walk_transaction_preserves_record_semantics() {
+    use super::DmarcDiscovery;
+
+    let resolver = MessageAuthenticator::new_system_conf().unwrap();
+    let cache = TransactionCache::new();
+    cache.seed(
+        "_dmarc.xn--eebajf.xn--9dbq2a.",
+        "v=DMARC1; p=quarantine; sp=reject; np=none; rua=mailto:d@xn--eebajf.xn--9dbq2a",
+    );
+    let mut discovery = DmarcDiscovery::new(Some(&cache));
+    let walk = resolver
+        .dmarc_tree_walk("sub.xn--eebajf.xn--9dbq2a", &mut discovery)
+        .await
+        .unwrap();
+    assert_eq!(
+        walk.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+        vec!["xn--eebajf.xn--9dbq2a"]
+    );
+    let record = &walk[0].1;
+    assert_eq!(record.p, Policy::Quarantine);
+    assert_eq!(record.sp, Policy::Reject);
+    assert_eq!(record.np, Policy::None);
+    assert_eq!(record.rua.len(), 1);
+    // The ancestor without a DMARC record got a cached negative answer.
+    assert!(cache.contains("_dmarc.sub.xn--eebajf.xn--9dbq2a."));
 }

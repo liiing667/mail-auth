@@ -41,7 +41,9 @@ pub mod sign;
 pub mod streaming;
 pub mod verify;
 
-pub use output::{DkimOutput, DkimResult};
+pub use output::{
+    DkimEvaluation, DkimOutput, DkimResult, DkimVerification, DkimVerificationIdentity,
+};
 pub use record::{AtpsRecord, DkimReportRecord, DomainKey, VerifySignature};
 pub(crate) use record::{
     Flag, RR_DNS, RR_EXPIRATION, RR_OTHER, RR_POLICY, RR_SIGNATURE, RR_UNKNOWN_TAG,

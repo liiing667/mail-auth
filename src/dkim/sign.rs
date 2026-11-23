@@ -662,6 +662,8 @@ pub(crate) mod test {
                 signature: None,
                 report: d.report,
                 is_atps: d.is_atps,
+                verification: None,
+                message: None,
             })
             .collect()
     }

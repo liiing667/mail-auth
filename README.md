@@ -148,6 +148,8 @@ On WASM, DoH requests are issued through the browser Fetch API, randomness comes
     // Verify as usual
     let authenticator = MessageAuthenticator::new_cloudflare_tls().unwrap();
     let result = authenticator.verify_dkim(&authenticated_message).await;
+    // Every output is bound to this streamed message snapshot.
+    assert!(result.iter().all(|output| output.is_for_message(&authenticated_message)));
     assert!(result.iter().all(|s| s.result() == &DkimResult::Pass));
 ```
 

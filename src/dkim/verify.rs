@@ -13,14 +13,15 @@ use crate::{
     AuthenticatedMessage, DkimOutput, DkimResult, Error, MessageAuthenticator, Parameters,
     dkim::{DomainKey, VerifySignature},
     dns::cache::NoCache,
+    message::{IdentityHasher, MessageIdentity},
     sampling::is_within_pct,
 };
 use crate::{DnsError, crypto::CryptoError};
 use encodify::base32;
 
 use super::{
-    AtpsRecord, DkimError, DkimReportRecord, HashAlgorithm, RR_DNS, RR_EXPIRATION, RR_OTHER,
-    RR_SIGNATURE, RR_VERIFICATION, Signature,
+    AtpsRecord, Canonicalization, DkimError, DkimReportRecord, DkimVerification, HashAlgorithm,
+    RR_DNS, RR_EXPIRATION, RR_OTHER, RR_SIGNATURE, RR_VERIFICATION, Signature,
 };
 
 impl MessageAuthenticator {
@@ -33,6 +34,13 @@ impl MessageAuthenticator {
     /// (see [`DkimOutput`]), then one per parsed signature in header order. A
     /// message without signatures yields an empty vector; this function never
     /// fails.
+    ///
+    /// Every output is produced from one verification instance that fixes the
+    /// message snapshot and the signature's own header and body scope (see
+    /// [`DkimOutput::verification`](DkimOutput::verification)). Outputs from
+    /// another message snapshot therefore have a different
+    /// [`DkimOutput::message_identity`](DkimOutput::message_identity), even
+    /// when the message headers or canonicalization settings look identical.
     ///
     /// For each well formed, unexpired signature whose body hash matches, it
     /// looks up the key record, a TXT record at `<s>._domainkey.<d>`
@@ -99,112 +107,30 @@ impl MessageAuthenticator {
         let message = params.input;
         let mut output = Vec::with_capacity(message.dkim_headers.len() + message.errors.len());
         let mut report_requested = false;
+        let txt_cache = params.txt_cache();
+        let verification = DkimVerificationContext::new(message);
 
-        for header in &message.errors {
+        for (position, header) in message.errors.iter().enumerate() {
             if let Error::Dkim(_) = &header.header {
-                output.push(DkimOutput::neutral(header.header.clone()));
+                output.push(
+                    DkimOutput::neutral(header.header.clone())
+                        .with_verification(verification.for_rejected_header(header, position))
+                        .with_message_snapshot(message),
+                );
             }
         }
 
-        for header in &message.dkim_headers {
+        for (position, header) in message.dkim_headers.iter().enumerate() {
             let signature = &header.header;
             if signature.r {
                 report_requested = true;
             }
 
-            if !(signature.x == 0 || (signature.x > signature.t && signature.x > now)) {
-                output.push(
-                    DkimOutput::neutral(Error::Dkim(DkimError::SignatureExpired))
-                        .with_signature(signature),
-                );
-                continue;
-            }
-
-            let ha = HashAlgorithm::from(signature.a);
-            let bh = &message
-                .body_hashes
-                .iter()
-                .find(|(c, h, l, _)| c == &signature.cb && h == &ha && l == &signature.l)
-                .unwrap()
-                .3;
-
-            if bh != &signature.bh {
-                output.push(
-                    DkimOutput::neutral(Error::Dkim(DkimError::BodyHashMismatch))
-                        .with_signature(signature),
-                );
-                continue;
-            }
-
-            let record = match self
-                .txt_lookup::<DomainKey>(signature.domain_key(), params.txt_cache())
-                .await
-            {
-                Ok(record) => record,
-                Err(err) => {
-                    output.push(DkimOutput::dns_error(err).with_signature(signature));
-                    continue;
-                }
-            };
-
-            if !signature.validate_auid(&record) {
-                output.push(
-                    DkimOutput::fail(Error::Dkim(DkimError::AuidMismatch))
-                        .with_signature(signature),
-                );
-                continue;
-            }
-
-            let dkim_hdr_value = header.value.strip_signature();
-            let mut headers = message.signed_headers(&signature.h, header.name, &dkim_hdr_value);
-
-            if let Err(err) = record.verify(&mut headers, signature, signature.ch) {
-                output.push(DkimOutput::fail(err).with_signature(signature));
-                continue;
-            }
-
-            if let Some(atps) = &signature.atps {
-                let mut found = false;
-                for from in &message.from {
-                    if let Some((_, domain)) = from.rsplit_once('@')
-                        && domain.eq(atps)
-                    {
-                        found = true;
-                        break;
-                    }
-                }
-
-                if found {
-                    let mut query_domain = match &signature.atpsh {
-                        Some(algorithm) => {
-                            base32::STANDARD_NO_PAD.encode(algorithm.hash(signature.d.as_bytes()))
-                        }
-                        None => signature.d.to_string(),
-                    };
-                    query_domain.push_str("._atps.");
-                    query_domain.push_str(atps);
-                    query_domain.push('.');
-
-                    match self
-                        .txt_lookup::<AtpsRecord>(query_domain, params.txt_cache())
-                        .await
-                    {
-                        Ok(_) => {
-                            output.push(DkimOutput::pass().with_atps().with_signature(signature));
-                        }
-                        Err(err) => {
-                            output.push(
-                                DkimOutput::dns_error(err)
-                                    .with_atps()
-                                    .with_signature(signature),
-                            );
-                        }
-                    }
-                    continue;
-                }
-            }
-
-            output.push(DkimOutput::pass().with_signature(signature));
+            output.push(
+                self.verify_dkim_signature(&verification, header, position, now, txt_cache)
+                    .await
+                    .with_message_snapshot(message),
+            );
         }
 
         if report_requested {
@@ -222,7 +148,7 @@ impl MessageAuthenticator {
                 let record = if let Ok(record) = self
                     .txt_lookup::<DkimReportRecord>(
                         format!("_report._domainkey.{}.", signature.d),
-                        params.txt_cache(),
+                        txt_cache,
                     )
                     .await
                 {
@@ -287,6 +213,231 @@ impl MessageAuthenticator {
         }
 
         output
+    }
+
+    async fn verify_dkim_signature<'x, C>(
+        &self,
+        context: &DkimVerificationContext<'x>,
+        header: &'x crate::headers::Header<'x, Signature>,
+        position: usize,
+        now: u64,
+        txt_cache: Option<&C::Txt>,
+    ) -> DkimOutput<'x>
+    where
+        C: DnsCache,
+    {
+        let message = context.message;
+        let signature = &header.header;
+        let algorithm = HashAlgorithm::from(signature.a);
+        let body_hash = message
+            .body_hashes
+            .iter()
+            .find(|entry| {
+                let entry = *entry;
+                entry.0 == signature.cb && entry.1 == algorithm && entry.2 == signature.l
+            });
+        let verification = context.for_signature(header, body_hash, position);
+
+        if !(signature.x == 0 || (signature.x > signature.t && signature.x > now)) {
+            return DkimOutput::neutral(Error::Dkim(DkimError::SignatureExpired))
+                .with_signature(signature)
+                .with_verification(verification);
+        }
+
+        let Some(body_hash) = body_hash else {
+            // A streamed snapshot that did not compute this signature's body
+            // hash must not fall back to another signature's evidence.
+            return DkimOutput::neutral(Error::BodyNotAvailable)
+                .with_signature(signature)
+                .with_verification(verification);
+        };
+
+        if body_hash.3.as_slice() != signature.bh.as_slice() {
+            return DkimOutput::neutral(Error::Dkim(DkimError::BodyHashMismatch))
+                .with_signature(signature)
+                .with_verification(verification);
+        }
+
+        let record = match self
+            .txt_lookup::<DomainKey>(signature.domain_key(), txt_cache)
+            .await
+        {
+            Ok(record) => record,
+            Err(err) => {
+                return DkimOutput::dns_error(err)
+                    .with_signature(signature)
+                    .with_verification(verification);
+            }
+        };
+
+        if !signature.validate_auid(&record) {
+            return DkimOutput::fail(Error::Dkim(DkimError::AuidMismatch))
+                .with_signature(signature)
+                .with_verification(verification);
+        }
+
+        let dkim_hdr_value = header.value.strip_signature();
+        let mut headers = message.signed_headers(&signature.h, header.name, &dkim_hdr_value);
+
+        if let Err(err) = record.verify(&mut headers, signature, signature.ch) {
+            return DkimOutput::fail(err)
+                .with_signature(signature)
+                .with_verification(verification);
+        }
+
+        if let Some(atps) = &signature.atps {
+            let mut found = false;
+            for from in &message.from {
+                if let Some((_, domain)) = from.rsplit_once('@')
+                    && domain.eq(atps)
+                {
+                    found = true;
+                    break;
+                }
+            }
+
+            if found {
+                let mut query_domain = match &signature.atpsh {
+                    Some(algorithm) => {
+                        base32::STANDARD_NO_PAD.encode(algorithm.hash(signature.d.as_bytes()))
+                    }
+                    None => signature.d.to_string(),
+                };
+                query_domain.push_str("._atps.");
+                query_domain.push_str(atps);
+                query_domain.push('.');
+
+                return match self.txt_lookup::<AtpsRecord>(query_domain, txt_cache).await {
+                    Ok(_) => DkimOutput::pass()
+                        .with_atps()
+                        .with_signature(signature)
+                        .with_verification(verification),
+                    Err(err) => DkimOutput::dns_error(err)
+                        .with_atps()
+                        .with_signature(signature)
+                        .with_verification(verification),
+                };
+            }
+        }
+
+        DkimOutput::pass()
+            .with_signature(signature)
+            .with_verification(verification)
+    }
+}
+
+/// The message snapshot shared by every signature of one `verify_dkim` call.
+///
+/// The context is created once, before any signature is evaluated, and fixes
+/// the message identity. Every [`DkimOutput`] produced from this context
+/// carries the same identity and the identity of its own signature scope, so
+/// a result can never be attributed to another message snapshot or to another
+/// signature in the same message.
+struct DkimVerificationContext<'x> {
+    message: &'x AuthenticatedMessage<'x>,
+    identity: MessageIdentity,
+}
+
+impl<'x> DkimVerificationContext<'x> {
+    fn new(message: &'x AuthenticatedMessage<'x>) -> Self {
+        DkimVerificationContext {
+            message,
+            identity: message.identity(),
+        }
+    }
+
+    fn for_signature(
+        &self,
+        header: &crate::headers::Header<'_, Signature>,
+        body_hash: Option<&(Canonicalization, HashAlgorithm, u64, Vec<u8>)>,
+        position: usize,
+    ) -> DkimVerification {
+        let signature = &header.header;
+        let mut hasher = IdentityHasher::new();
+        hasher.update(&self.identity.digest());
+        hasher.update_u64(self.identity.len());
+        hasher.update_u64(position as u64);
+        hasher.update_u64(header.name.len() as u64);
+        hasher.update(header.name);
+        hasher.update_u64(header.value.len() as u64);
+        hasher.update(header.value);
+        hasher.update_u64(signature.v as u64);
+        hasher.update_u64(algorithm_id(signature.a));
+        hasher.update_u64(signature.t);
+        hasher.update_u64(signature.x);
+        hasher.update_u64(signature.l);
+        hasher.update_u64(canonicalization_id(signature.ch));
+        hasher.update_u64(canonicalization_id(signature.cb));
+        hasher.update_u64(signature.r as u64);
+        for name in &signature.h {
+            hasher.update_u64(name.len() as u64);
+            hasher.update(name.as_bytes());
+        }
+        for value in [
+            signature.d.as_bytes(),
+            signature.s.as_bytes(),
+            signature.i.as_bytes(),
+            signature.b.as_slice(),
+            signature.bh.as_slice(),
+        ] {
+            hasher.update_u64(value.len() as u64);
+            hasher.update(value);
+        }
+        if let Some(entry) = body_hash {
+            let entry = *entry;
+            hasher.update_u64(canonicalization_id(entry.0));
+            hasher.update_u64(algorithm_id(entry.1));
+            hasher.update_u64(entry.2);
+            hasher.update_u64(entry.3.len() as u64);
+            hasher.update(&entry.3);
+        }
+
+        DkimVerification {
+            message: self.identity,
+            signature: hasher.finish(),
+            signature_len: header.value.len() as u64,
+            position: position as u64,
+        }
+    }
+
+    fn for_rejected_header(
+        &self,
+        header: &crate::headers::Header<'_, Error>,
+        position: usize,
+    ) -> DkimVerification {
+        let mut hasher = IdentityHasher::new();
+        hasher.update(&self.identity.digest());
+        hasher.update_u64(self.identity.len());
+        hasher.update_u64(position as u64);
+        hasher.update_u64(header.name.len() as u64);
+        hasher.update(header.name);
+        hasher.update_u64(header.value.len() as u64);
+        hasher.update(header.value);
+
+        DkimVerification {
+            message: self.identity,
+            signature: hasher.finish(),
+            signature_len: header.value.len() as u64,
+            position: position as u64,
+        }
+    }
+}
+
+#[inline]
+fn algorithm_id(algorithm: crate::crypto::Algorithm) -> u64 {
+    match algorithm {
+        crate::crypto::Algorithm::RsaSha1 => 1,
+        crate::crypto::Algorithm::RsaSha256 => 2,
+        crate::crypto::Algorithm::Ed25519Sha256 => 3,
+        crate::crypto::Algorithm::MlDsa44 => 4,
+    }
+}
+
+#[inline]
+fn canonicalization_id(canonicalization: Canonicalization) -> u64 {
+    match canonicalization {
+        Canonicalization::Relaxed => 1,
+        Canonicalization::Simple => 2,
     }
 }
 

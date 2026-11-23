@@ -52,7 +52,9 @@ pub use hickory_resolver;
 pub use arc::{ArcOutput, ArcResult};
 pub use auth_results::{AuthenticationResults, ReceivedSpf};
 pub use authenticator::MessageAuthenticator;
-pub use dkim::{DkimOutput, DkimResult};
+pub use dkim::{
+    DkimEvaluation, DkimOutput, DkimResult, DkimVerification, DkimVerificationIdentity,
+};
 pub use dkim2::{Dkim2Output, Dkim2Result};
 pub use dmarc::{DmarcOutput, DmarcResult};
 pub use dns::{
@@ -61,5 +63,5 @@ pub use dns::{
 };
 pub use error::{DnsError, Error, Result};
 pub use iprev::{IprevOutput, IprevResult};
-pub use message::AuthenticatedMessage;
+pub use message::{AuthenticatedMessage, MessageIdentity};
 pub use spf::{SpfOutput, SpfResult};

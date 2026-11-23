@@ -41,7 +41,7 @@ use crate::{
     dkim::{Canonicalization, canonicalize::BodyHasher, streaming::find_header_boundary},
     dkim2::{Dkim2Hash, recipe::BodyRecipe, streaming::BodyDigests},
     headers::Writer,
-    message::StreamedBody,
+    message::{MessageIdentity, StreamedBody},
 };
 
 type BodyHash = (Canonicalization, HashAlgorithm, u64, Vec<u8>);
@@ -61,6 +61,7 @@ pub struct MessageStream {
 struct BodyState {
     hashers: Vec<(Canonicalization, HashAlgorithm, u64, BodyHasher<AnyHash>)>,
     dkim2: Option<BodyHasher<BodyDigests>>,
+    identity: <Sha256 as HashImpl>::Context,
     len: u64,
 }
 
@@ -162,6 +163,31 @@ impl MessageStream {
         }
     }
 
+    /// Discards the current message so the stream can parse another one.
+    ///
+    /// The parsing mode and the hashes declared with
+    /// [`also_hash`](Self::also_hash) and
+    /// [`also_hash_dkim2`](Self::also_hash_dkim2) are kept. A retried message
+    /// therefore starts with a fresh body and cannot reuse body evidence from
+    /// the message that was parsed before the reset.
+    pub fn reset(&mut self) {
+        self.buffer.clear();
+        self.scanned = 0;
+        self.body = None;
+        self.valid = false;
+        self.needs_body = false;
+    }
+
+    /// Alias for [`reset`](Self::reset).
+    pub fn rewind(&mut self) {
+        self.reset();
+    }
+
+    /// Alias for [`reset`](Self::reset).
+    pub fn clear(&mut self) {
+        self.reset();
+    }
+
     fn start_body(&mut self, header_end: usize) {
         let header_section = self.buffer.get(..header_end).unwrap_or_default();
         let parsed = AuthenticatedMessage::parse_with_opts(header_section, None, self.strict);
@@ -202,6 +228,7 @@ impl MessageStream {
                 .map(|(cb, ha, l)| (cb, ha, l, BodyHasher::new(AnyHash::new(ha), cb, l)))
                 .collect(),
             dkim2: (!dkim2.is_empty()).then(|| BodyDigests::hasher_for(dkim2)),
+            identity: Sha256::hasher(),
             len: 0,
         };
         body.write(self.buffer.get(body_offset..).unwrap_or_default());
@@ -223,24 +250,34 @@ impl MessageStream {
             .take()
             .filter(|_| self.valid)
             .ok_or(Error::Parse)?;
+        let BodyState {
+            hashers,
+            dkim2,
+            identity,
+            len,
+        } = body;
 
         Ok(StreamedMessage {
             headers: self.buffer,
             strict: self.strict,
             needs_body: self.needs_body,
-            hashes: body
-                .hashers
+            hashes: hashers
                 .into_iter()
                 .map(|(cb, ha, l, hasher)| {
                     (cb, ha, l, hasher.finish().0.complete().as_ref().to_vec())
                 })
                 .collect(),
             body: StreamedBody {
-                len: body.len,
-                dkim2: body
-                    .dkim2
+                len,
+                dkim2: dkim2
                     .map(|hasher| hasher.finish().0.complete())
                     .unwrap_or_default(),
+                digest: {
+                    let digest = identity.complete();
+                    let mut bytes = [0u8; 32];
+                    bytes.copy_from_slice(digest.as_ref());
+                    bytes
+                },
             },
         })
     }
@@ -249,6 +286,7 @@ impl MessageStream {
 impl BodyState {
     fn write(&mut self, chunk: &[u8]) {
         self.len += chunk.len() as u64;
+        self.identity.write(chunk);
         for (_, _, _, hasher) in &mut self.hashers {
             hasher.write(chunk);
         }
@@ -270,8 +308,12 @@ pub struct StreamedMessage {
 
 impl StreamedMessage {
     /// The message, for the `verify_*` methods, ARC sealing and DKIM2
-    /// signing. Its [`raw_body`](AuthenticatedMessage::raw_body) is empty.
-    pub fn message(&self) -> AuthenticatedMessage<'_> {
+    /// signing, or an error when a signature names body evidence the stream
+    /// did not compute.
+    ///
+    /// The returned message borrows only the buffered header section; its
+    /// body is represented by the streamed evidence.
+    pub fn try_message(&self) -> crate::Result<AuthenticatedMessage<'_>> {
         AuthenticatedMessage::parse_streamed(
             &self.headers,
             None,
@@ -279,7 +321,44 @@ impl StreamedMessage {
             &self.hashes,
             self.body.clone(),
         )
-        .unwrap_or_default()
+    }
+
+    /// The message, for the `verify_*` methods, ARC sealing and DKIM2
+    /// signing. Its [`raw_body`](AuthenticatedMessage::raw_body) is empty.
+    pub fn message(&self) -> AuthenticatedMessage<'_> {
+        self.try_message().unwrap_or_default()
+    }
+
+    /// Returns the identity of the message snapshot built from this stream.
+    ///
+    /// The identity is fixed by the buffered header section and the body
+    /// evidence the stream collected; it is the same value
+    /// [`AuthenticatedMessage::identity`] returns for [`message`](Self::message).
+    ///
+    /// When a signature names body evidence the stream did not compute,
+    /// [`try_identity`](Self::try_identity) reports the error instead of
+    /// returning the default (empty) identity.
+    pub fn identity(&self) -> MessageIdentity {
+        self.message().identity()
+    }
+
+    /// Returns the identity of the message snapshot, or the error that
+    /// prevented the streamed evidence from forming a message.
+    pub fn try_identity(&self) -> crate::Result<MessageIdentity> {
+        self.try_message().map(|message| message.identity())
+    }
+
+    /// Returns the number of body bytes the stream collected.
+    pub fn body_len(&self) -> u64 {
+        self.body.len
+    }
+
+    /// Returns the SHA-256 digest of every body byte the stream collected.
+    ///
+    /// This digest is independent of DKIM or ARC canonicalization and is the
+    /// body evidence used by [`identity`](Self::identity).
+    pub fn body_digest(&self) -> [u8; 32] {
+        self.body.digest
     }
 
     /// The message with the header fields in `prepend` added in front of
@@ -466,6 +545,47 @@ mod test {
                 .unwrap()
                 .signature
                 .bh
+        );
+    }
+
+    // A streamed snapshot and the same buffered message describe one message
+    // revision, while a different body produces a different identity.
+    #[test]
+    fn streamed_identity_matches_buffered_message() {
+        let first = b"From: a@manchego.org\r\nTo: b@example.org\r\nSubject: x\r\n\r\nfirst body\r\n";
+        let second =
+            b"From: a@manchego.org\r\nTo: b@example.org\r\nSubject: x\r\n\r\nthird body\r\n";
+
+        let buffered = AuthenticatedMessage::parse(first).unwrap();
+        let streamed = stream(first, 5, true).message();
+        assert_eq!(buffered.identity(), streamed.identity());
+        assert!(buffered.identity().is_for_message(&streamed));
+
+        let other = AuthenticatedMessage::parse(second).unwrap();
+        assert_ne!(buffered.identity(), other.identity());
+        assert!(!buffered.identity().is_for_message(&other));
+    }
+
+    // A retried message starts with fresh body evidence and cannot inherit
+    // the previous message's identity.
+    #[test]
+    fn reset_starts_a_new_message_snapshot() {
+        let first = b"From: a@manchego.org\r\nSubject: x\r\n\r\nfirst body\r\n";
+        let second = b"From: a@manchego.org\r\nSubject: x\r\n\r\nthird body\r\n";
+
+        let mut stream = MessageStream::new();
+        stream.write(first);
+        stream.reset();
+        stream.write(second);
+        let streamed = stream.finish().unwrap();
+
+        assert_eq!(
+            streamed.identity(),
+            AuthenticatedMessage::parse(second).unwrap().identity()
+        );
+        assert_ne!(
+            streamed.identity(),
+            AuthenticatedMessage::parse(first).unwrap().identity()
         );
     }
 

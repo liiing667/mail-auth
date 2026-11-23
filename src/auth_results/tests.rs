@@ -34,6 +34,8 @@ fn authentication_results() {
                     .into(),
                 report: None,
                 is_atps: false,
+                verification: None,
+                message: None,
             },
         ),
         (
@@ -52,6 +54,8 @@ fn authentication_results() {
                     .into(),
                 report: None,
                 is_atps: false,
+                verification: None,
+                message: None,
             },
         ),
         (
@@ -70,6 +74,8 @@ fn authentication_results() {
                     .into(),
                 report: None,
                 is_atps: true,
+                verification: None,
+                message: None,
             },
         ),
     ] {
@@ -357,6 +363,8 @@ fn dkim_result_header_injection() {
         signature: Some(&signature),
         report: None,
         is_atps: false,
+        verification: None,
+        message: None,
     };
     let auth_results =
         AuthenticationResults::new("mx.example.org").with_dkim_result(&output, "from@example.org");
@@ -381,6 +389,8 @@ fn dkim_result_header_i_quoted_local_part() {
         signature: Some(&signature),
         report: None,
         is_atps: false,
+        verification: None,
+        message: None,
     };
     let auth_results =
         AuthenticationResults::new("mx.example.org").with_dkim_result(&output, "from@example.org");
@@ -402,6 +412,8 @@ fn dkim_result_header_d_injection() {
         signature: Some(&signature),
         report: None,
         is_atps: false,
+        verification: None,
+        message: None,
     };
     let auth_results =
         AuthenticationResults::new("mx.example.org").with_dkim_result(&output, "from@example.org");

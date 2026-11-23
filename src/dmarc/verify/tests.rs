@@ -122,6 +122,8 @@ async fn dmarc_verify_alignment() {
             signature: (&signature).into(),
             report: None,
             is_atps: false,
+            verification: None,
+            message: None,
         };
         let spf = SpfOutput {
             result: spf,
@@ -310,6 +312,8 @@ async fn dmarc_verify_temp_errors() {
             signature: (&signature).into(),
             report: None,
             is_atps: false,
+            verification: None,
+            message: None,
         };
         let spf = SpfOutput {
             result: spf,

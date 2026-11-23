@@ -18,14 +18,85 @@
 use crate::arc;
 use crate::{
     Error,
-    crypto::HashAlgorithm,
+    crypto::{HashAlgorithm, HashContext, HashImpl, Sha256},
     dkim::{self, Canonicalization},
     dkim2::{self, Dkim2Hash, canonicalize::Digests},
-    headers::{AuthenticatedHeader, Header, HeaderParser},
+    headers::{AuthenticatedHeader, Header, HeaderParser, Writer},
 };
 use mail_parser::{AddressList, HeaderForm, HeaderName, Message};
 
 const EXPECTED_HEADER_COUNT: usize = 32;
+
+/// An opaque identity for one parsed message revision.
+///
+/// The identity covers the header snapshot, the body offset and every body
+/// hash computed while parsing (or streamed into the message). Two parsed
+/// revisions with the same evidence have the same identity; changing a
+/// header, the body or the canonicalization evidence produces a different
+/// identity.
+///
+/// Verification results carry this value so that a result produced for one
+/// message snapshot cannot be presented as the result of another snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct MessageIdentity {
+    digest: [u8; 16],
+    len: u64,
+}
+
+impl MessageIdentity {
+    /// Returns the opaque digest that identifies the message revision.
+    pub fn digest(&self) -> [u8; 16] {
+        self.digest
+    }
+
+    /// Returns the length in bytes of the message revision.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Returns `true` when the identity was produced for an empty message.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Returns `true` when this identity was produced for `message`.
+    pub fn is_for_message(&self, message: &AuthenticatedMessage<'_>) -> bool {
+        *self == message.identity()
+    }
+
+    pub(crate) fn new(digest: [u8; 16], len: u64) -> Self {
+        MessageIdentity { digest, len }
+    }
+}
+
+/// Deterministic hasher used to derive [`MessageIdentity`] values and the
+/// per-signature identity attached to a [`DkimOutput`](crate::DkimOutput).
+pub(crate) struct IdentityHasher {
+    hasher: <Sha256 as HashImpl>::Context,
+}
+
+impl IdentityHasher {
+    pub(crate) fn new() -> Self {
+        IdentityHasher {
+            hasher: Sha256::hasher(),
+        }
+    }
+
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        self.hasher.write(bytes);
+    }
+
+    pub(crate) fn update_u64(&mut self, value: u64) {
+        self.update(&value.to_be_bytes());
+    }
+
+    pub(crate) fn finish(self) -> [u8; 16] {
+        let digest = self.hasher.complete();
+        let mut identity = [0u8; 16];
+        identity.copy_from_slice(&digest.as_ref()[..16]);
+        identity
+    }
+}
 
 /// An RFC 5322 message prepared for DKIM, DKIM2, ARC and DMARC verification.
 ///
@@ -78,6 +149,10 @@ pub struct AuthenticatedMessage<'x> {
 pub(crate) struct StreamedBody {
     pub(crate) len: u64,
     pub(crate) dkim2: Digests,
+    /// SHA-256 over every body byte, independent of any signature. It lets
+    /// two streamed snapshots with different bodies be distinguished even
+    /// when the message carried no signature that asked for a body hash.
+    pub(crate) digest: [u8; 32],
 }
 
 impl StreamedBody {
@@ -88,11 +163,30 @@ impl StreamedBody {
     }
 
     pub(crate) fn same_as(&self, other: &Self) -> bool {
-        self.len == other.len
-            && self.dkim2.iter().zip(&other.dkim2).any(|pair| match pair {
-                (Some(a), Some(b)) => a.as_ref() == b.as_ref(),
-                _ => false,
-            })
+        if self.len != other.len || self.digest != other.digest {
+            return false;
+        }
+        if self.dkim2.iter().all(|digest| digest.is_none())
+            && other.dkim2.iter().all(|digest| digest.is_none())
+        {
+            return true;
+        }
+
+        // A length alone does not prove that two bodies are identical. At
+        // least one digest must be present on both sides, and every digest
+        // present on both sides must agree. A message with only a SHA-256
+        // digest therefore cannot be declared identical to a message with
+        // only a SHA-512 digest.
+        let mut shared = false;
+        for (a, b) in self.dkim2.iter().zip(&other.dkim2) {
+            if let (Some(a), Some(b)) = (a, b) {
+                if a.as_ref() != b.as_ref() {
+                    return false;
+                }
+                shared = true;
+            }
+        }
+        shared
     }
 }
 
@@ -119,6 +213,131 @@ impl<'x> TryFrom<&'x Vec<u8>> for AuthenticatedMessage<'x> {
 }
 
 impl<'x> AuthenticatedMessage<'x> {
+    /// Returns the identity of this exact parsed message revision.
+    ///
+    /// The identity covers the parsed header snapshot, the body offset and
+    /// every body hash computed for the message. Streamed messages contribute
+    /// their body length and a digest of the full body, so two messages that
+    /// share a header section but differ in body evidence have different
+    /// identities.
+    pub fn identity(&self) -> MessageIdentity {
+        let mut hasher = IdentityHasher::new();
+        hasher.update_u64(self.body_offset as u64);
+        hasher.update_u64(self.headers.len() as u64);
+        for (name, value) in &self.headers {
+            hasher.update_u64(name.len() as u64);
+            hasher.update(name);
+            hasher.update_u64(value.len() as u64);
+            hasher.update(value);
+        }
+
+        // The order in which body hashes were discovered is an implementation
+        // detail. Hash them sorted so equivalent snapshots built by the
+        // buffered and streamed parsers keep the same semantic evidence.
+        let mut named_body_hashes: Vec<(Canonicalization, HashAlgorithm, u64)> = Vec::new();
+        for header in &self.dkim_headers {
+            named_body_hashes.push((
+                header.header.cb,
+                HashAlgorithm::from(header.header.a),
+                header.header.l,
+            ));
+        }
+        #[cfg(feature = "arc")]
+        for header in &self.ams_headers {
+            named_body_hashes.push((
+                header.header.cb,
+                HashAlgorithm::from(header.header.a),
+                header.header.l,
+            ));
+        }
+        let mut body_hashes: Vec<_> = self.body_hashes.iter().collect();
+        body_hashes.retain(|entry| {
+            let entry = *entry;
+            named_body_hashes.iter().any(|named| {
+                named.0 == entry.0 && named.1 == entry.1 && named.2 == entry.2
+            })
+        });
+        body_hashes.sort_unstable_by(|a, b| {
+            let a = *a;
+            let b = *b;
+            (a.0 as u8, a.1 as u64, a.2, &a.3).cmp(&(b.0 as u8, b.1 as u64, b.2, &b.3))
+        });
+        hasher.update_u64(body_hashes.len() as u64);
+        for entry in body_hashes {
+            hasher.update_u64(entry.0 as u64);
+            hasher.update_u64(entry.1 as u64);
+            hasher.update_u64(entry.2);
+            hasher.update_u64(entry.3.len() as u64);
+            hasher.update(&entry.3);
+        }
+
+        hasher.update_u64(self.dkim_headers.len() as u64);
+        hasher.update_u64(self.dkim2_signatures.len() as u64);
+        hasher.update_u64(self.dkim2_instances.len() as u64);
+        hasher.update_u64(self.errors.len() as u64);
+        hasher.update_u64(self.has_dkim_errors as u64);
+        hasher.update_u64(self.has_dkim2_errors as u64);
+        #[cfg(feature = "arc")]
+        {
+            hasher.update_u64(self.ams_headers.len() as u64);
+            hasher.update_u64(self.as_headers.len() as u64);
+            hasher.update_u64(self.aar_headers.len() as u64);
+            hasher.update_u64(self.has_arc_errors as u64);
+        }
+
+        let body_len = if let Some(body) = &self.streamed_body {
+            body.len
+        } else {
+            self.raw_message
+                .get(self.body_offset as usize..)
+                .unwrap_or_default()
+                .len() as u64
+        };
+        hasher.update_u64(body_len);
+        let body_digest = self.body_digest();
+        hasher.update(&body_digest);
+
+        let message_len = self.raw_message.len() as u64
+            + self
+                .streamed_body
+                .as_deref()
+                .map_or(0, |body| body.len);
+        MessageIdentity::new(hasher.finish(), message_len)
+    }
+
+    /// Alias for [`identity`](Self::identity).
+    pub fn message_instance(&self) -> MessageIdentity {
+        self.identity()
+    }
+
+    /// Alias for [`identity`](Self::identity).
+    pub fn fingerprint(&self) -> MessageIdentity {
+        self.identity()
+    }
+
+    /// Alias for [`identity`](Self::identity).
+    pub fn verification_identity(&self) -> MessageIdentity {
+        self.identity()
+    }
+
+    /// Returns the SHA-256 digest of the message body.
+    ///
+    /// Buffered messages hash the body bytes directly; streamed messages
+    /// return the digest collected while the body was read.
+    pub fn body_digest(&self) -> [u8; 32] {
+        if let Some(body) = &self.streamed_body {
+            return body.digest;
+        }
+        let digest = Sha256::digest(
+            self.raw_message
+                .get(self.body_offset as usize..)
+                .unwrap_or_default(),
+        );
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(digest.as_ref());
+        bytes
+    }
+
     /// Parses a raw RFC 5322 message in strict mode.
     ///
     /// Equivalent to [`parse_with_opts(raw_message, None, true)`](Self::parse_with_opts).
@@ -260,6 +479,21 @@ impl<'x> AuthenticatedMessage<'x> {
         message.parse_headers(header_section, strict);
         if message.headers.is_empty() {
             return Err(Error::Parse);
+        }
+        // Two entries for the same canonicalization, algorithm and length
+        // must describe the same body. Otherwise the snapshot mixes evidence
+        // from two different bodies and no signature can safely claim it.
+        for (index, hash) in body_hashes.iter().enumerate() {
+            let conflicts = body_hashes[..index].iter().any(|other| {
+                let other = *other;
+                other.0 == hash.0
+                    && other.1 == hash.1
+                    && other.2 == hash.2
+                    && other.3 != hash.3
+            });
+            if conflicts {
+                return Err(Error::BodyNotAvailable);
+            }
         }
         message.body_offset = header_section.len() as u32;
         let mut message = message.finalize();
@@ -639,5 +873,33 @@ impl<'x> AuthenticatedMessage<'x> {
                 }
             });
         self.has_dkim_errors |= rejected;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuthenticatedMessage;
+
+    #[test]
+    fn message_identity_tracks_the_body_snapshot() {
+        let first = AuthenticatedMessage::parse(
+            b"From: a@example.org\r\nSubject: x\r\n\r\nfirst body\r\n",
+        )
+        .unwrap();
+        let second = AuthenticatedMessage::parse(
+            b"From: a@example.org\r\nSubject: x\r\n\r\nthird body\r\n",
+        )
+        .unwrap();
+        let reparsed = AuthenticatedMessage::parse(
+            b"From: a@example.org\r\nSubject: x\r\n\r\nfirst body\r\n",
+        )
+        .unwrap();
+
+        assert_ne!(first.identity(), second.identity());
+        assert_eq!(first.identity(), reparsed.identity());
+        assert_eq!(
+            first.identity().digest(),
+            reparsed.identity().digest()
+        );
     }
 }

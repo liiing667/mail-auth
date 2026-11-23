@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use super::{Macro, Mechanism, Qualifier, SpfIdentity, SpfRecord, Variables};
+use super::{
+    Macro, Mechanism, Qualifier, SpfEvaluationReport, SpfIdentity, SpfRecord, Variables,
+};
 use crate::DnsError;
 use crate::Instant;
 use crate::dns::{DnsCache, Negative, has_valid_labels};
@@ -14,6 +16,8 @@ use crate::{
 };
 use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Input of an SPF check: the client IP, the identity to check and the
 /// values used for macro expansion.
@@ -51,8 +55,11 @@ impl MessageAuthenticator {
     /// [`SpfParameters::mail_from`], a single [`check_host`] is run for that
     /// identity.
     ///
-    /// The DNS lookups performed are those of [`check_host`], once per
-    /// identity checked. See [`SpfResult`] for the meaning of each result.
+    /// HELO and MAIL FROM are separate `check_host()` evaluations, each with
+    /// its own ten-lookup budget as required by RFC 7208. The output reports
+    /// the source record, query budget, cache generation and qualifier of the
+    /// identity whose result is returned. See [`SpfResult`] for the meaning
+    /// of each result.
     ///
     /// # Example
     ///
@@ -87,21 +94,25 @@ impl MessageAuthenticator {
         match &params.input.sender {
             Sender::Full(sender) => {
                 let helo_output = self
-                    .check_host(params.clone_with(SpfParameters::helo(
-                        params.input.ip,
-                        params.input.helo_domain,
-                        params.input.host_domain,
-                    )))
+                    .check_host(
+                        params.clone_with(SpfParameters::helo(
+                            params.input.ip,
+                            params.input.helo_domain,
+                            params.input.host_domain,
+                        )),
+                    )
                     .await;
                 if sender.is_empty() || helo_output.result() == SpfResult::Fail {
                     helo_output
                 } else {
-                    self.check_host(params.clone_with(SpfParameters::mail_from(
-                        params.input.ip,
-                        params.input.helo_domain,
-                        params.input.host_domain,
-                        sender,
-                    )))
+                    self.check_host(
+                        params.clone_with(SpfParameters::mail_from(
+                            params.input.ip,
+                            params.input.helo_domain,
+                            params.input.host_domain,
+                            sender,
+                        )),
+                    )
                     .await
                 }
             }
@@ -166,7 +177,43 @@ impl MessageAuthenticator {
     where
         C: DnsCache + 'x,
     {
+        let evaluation = SpfEvaluation::new();
+        self.check_host_with(params, &evaluation).await
+    }
+
+    /// Runs [`check_host`](Self::check_host) against a caller-owned
+    /// [`SpfEvaluation`].
+    ///
+    /// Reusing the evaluation for a retry keeps the ten-query budget, the
+    /// twenty second deadline, the source record and the cache generation
+    /// observed by the first attempt. A different client IP, domain or
+    /// identity starts a new evaluation on the same object.
+    pub async fn check_host_with<'x, C>(
+        &self,
+        params: impl Into<Parameters<'x, SpfParameters<'x>, C>>,
+        evaluation: &SpfEvaluation,
+    ) -> SpfOutput
+    where
+        C: DnsCache + 'x,
+    {
         let params = params.into();
+        evaluation.bind(
+            SpfEvaluationIdentity::from_params(&params),
+            params.cache_generation(),
+        );
+        let output = self.check_host_eval(params, evaluation).await;
+        evaluation.finish(&output);
+        output.with_evaluation(evaluation.report(output.result()))
+    }
+
+    async fn check_host_eval<'x, C>(
+        &self,
+        params: Parameters<'x, SpfParameters<'x>, C>,
+        evaluation: &SpfEvaluation,
+    ) -> SpfOutput
+    where
+        C: DnsCache + 'x,
+    {
         let domain = params.input.domain;
         let ip = params.input.ip;
         let helo_domain = params.input.helo_domain;
@@ -180,6 +227,11 @@ impl MessageAuthenticator {
         if domain.is_empty() || domain.len() > 255 || !has_valid_labels(domain) {
             return output.with_result(SpfResult::None);
         }
+        if let Some(result) = evaluation.terminal_result() {
+            evaluation.note_attempt();
+            return output.with_result(result);
+        }
+        evaluation.start_check(domain);
         let postmaster;
         let sender = if sender.is_empty() {
             postmaster = postmaster_at(domain);
@@ -195,7 +247,6 @@ impl MessageAuthenticator {
         vars.set_host_domain(host_domain.as_bytes());
         vars.set_helo_domain(helo_domain.as_bytes());
 
-        let mut lookup_limit = LookupLimit::new();
         let mut spf_record = match self
             .txt_lookup::<SpfRecord>(domain, params.txt_cache())
             .await
@@ -213,7 +264,7 @@ impl MessageAuthenticator {
         loop {
             while let Some((pos, directive)) = directives.next() {
                 if !has_p_var && directive.mechanism.needs_ptr() {
-                    if !lookup_limit.can_lookup() {
+                    if !evaluation.can_lookup() {
                         return output
                             .with_result(SpfResult::PermError)
                             .with_report(&spf_record);
@@ -238,7 +289,7 @@ impl MessageAuthenticator {
                         ip4_mask,
                         ip6_mask,
                     } => {
-                        if !lookup_limit.can_lookup() {
+                        if !evaluation.can_lookup() {
                             return output
                                 .with_result(SpfResult::PermError)
                                 .with_report(&spf_record);
@@ -268,7 +319,7 @@ impl MessageAuthenticator {
                         ip4_mask,
                         ip6_mask,
                     } => {
-                        if !lookup_limit.can_lookup() {
+                        if !evaluation.can_lookup() {
                             return output
                                 .with_result(SpfResult::PermError)
                                 .with_report(&spf_record);
@@ -327,7 +378,7 @@ impl MessageAuthenticator {
                         matches
                     }
                     Mechanism::Include { macro_string } => {
-                        if !lookup_limit.can_lookup() {
+                        if !evaluation.can_lookup() {
                             return output
                                 .with_result(SpfResult::PermError)
                                 .with_report(&spf_record);
@@ -346,6 +397,7 @@ impl MessageAuthenticator {
                                     domain,
                                 ));
                                 directives = spf_record.directives.iter().enumerate().skip(0);
+                                evaluation.set_source(&new_domain);
                                 vars.set_domain(new_domain.as_bytes().to_vec());
                                 domain = Cow::Owned(new_domain);
                                 continue;
@@ -367,7 +419,7 @@ impl MessageAuthenticator {
                         }
                     }
                     Mechanism::Ptr { macro_string } => {
-                        if !lookup_limit.can_lookup() {
+                        if !evaluation.can_lookup() {
                             return output
                                 .with_result(SpfResult::PermError)
                                 .with_report(&spf_record);
@@ -382,7 +434,7 @@ impl MessageAuthenticator {
 
                         if let Ok(records) = self.ptr_lookup(ip, params.ptr_cache()).await {
                             for record in records.records.iter() {
-                                if lookup_limit.can_lookup()
+                                if evaluation.can_lookup()
                                     && let Ok(true) = self
                                         .ip_matches(
                                             record,
@@ -409,7 +461,7 @@ impl MessageAuthenticator {
                         matches
                     }
                     Mechanism::Exists { macro_string } => {
-                        if !lookup_limit.can_lookup() {
+                        if !evaluation.can_lookup() {
                             return output
                                 .with_result(SpfResult::PermError)
                                 .with_report(&spf_record);
@@ -439,7 +491,7 @@ impl MessageAuthenticator {
             }
 
             if let (Some(macro_string), None) = (&spf_record.redirect, &result) {
-                if !lookup_limit.can_lookup() {
+                if !evaluation.can_lookup() {
                     return output
                         .with_result(SpfResult::PermError)
                         .with_report(&spf_record);
@@ -454,6 +506,7 @@ impl MessageAuthenticator {
                         let new_domain = target_name.into_owned();
                         spf_record = redirect_spf;
                         directives = spf_record.directives.iter().enumerate().skip(0);
+                        evaluation.set_source(&new_domain);
                         vars.set_domain(new_domain.as_bytes().to_vec());
                         domain = Cow::Owned(new_domain);
                         continue;
@@ -478,6 +531,7 @@ impl MessageAuthenticator {
             if let Some((prev_record, prev_pos, prev_domain)) = include_stack.pop() {
                 spf_record = prev_record;
                 directives = spf_record.directives.iter().enumerate().skip(prev_pos);
+                evaluation.set_source(prev_domain.as_ref());
                 let qualifier = directives.next().map(|(_, directive)| &directive.qualifier);
 
                 if matches!(result, Some(SpfResult::Pass)) {
@@ -740,26 +794,209 @@ impl From<Error> for SpfResult {
     }
 }
 
-struct LookupLimit {
-    num_lookups: u32,
-    timer: Instant,
+const SPF_QUERY_LIMIT: u32 = 10;
+const SPF_EVALUATION_SECONDS: u64 = 20;
+
+static NEXT_SPF_GENERATION: AtomicUsize = AtomicUsize::new(1);
+
+fn next_spf_generation() -> u64 {
+    NEXT_SPF_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .max(1) as u64
 }
 
-impl LookupLimit {
+/// Identity of one resumable SPF evaluation.
+///
+/// Reusing a [`SpfEvaluation`] for the same identity keeps its budget. A
+/// different IP, domain, sender or HELO name starts a new evaluation on the
+/// same object, so unrelated checks cannot inherit a consumed budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpfEvaluationIdentity {
+    ip: IpAddr,
+    domain: Box<str>,
+    sender_kind: u8,
+    sender: Box<str>,
+    helo_domain: Box<str>,
+    host_domain: Box<str>,
+}
+
+impl SpfEvaluationIdentity {
+    fn from_params<C: DnsCache>(params: &Parameters<'_, SpfParameters<'_>, C>) -> Self {
+        let (sender_kind, sender): (u8, &str) = match &params.input.sender {
+            Sender::Helo => (0, ""),
+            Sender::MailFrom(sender) => (1, *sender),
+            Sender::Full(sender) => (2, *sender),
+        };
+
+        SpfEvaluationIdentity {
+            ip: params.input.ip,
+            domain: params.input.domain.to_lowercase().into_boxed_str(),
+            sender_kind,
+            sender: sender.to_lowercase().into_boxed_str(),
+            helo_domain: params.input.helo_domain.to_lowercase().into_boxed_str(),
+            host_domain: params.input.host_domain.to_lowercase().into_boxed_str(),
+        }
+    }
+}
+
+struct SpfEvaluationState {
+    generation: u64,
+    cache_generation: u64,
+    lookups: u32,
+    started: Instant,
+    attempts: u32,
+    source: Option<Box<str>>,
+    identity: Option<SpfEvaluationIdentity>,
+    completed: bool,
+    terminal: Option<SpfResult>,
+    exhausted: bool,
+}
+
+/// Resumable state for one SPF evaluation.
+///
+/// [`check_host`](MessageAuthenticator::check_host) creates a new value for
+/// each identity check. Use
+/// [`check_host_with`](MessageAuthenticator::check_host_with) with the same
+/// value to retry that identity. The evaluation freezes the query budget,
+/// deadline, source record and cache generation, and exposes them through
+/// [`SpfOutput::evaluation`](crate::spf::SpfOutput::evaluation).
+///
+/// Cloning is intentionally not implemented: each evaluation has its own
+/// mutable state and must not silently diverge into two budgets.
+pub struct SpfEvaluation {
+    state: Mutex<SpfEvaluationState>,
+}
+
+impl Default for SpfEvaluation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SpfEvaluation {
+    /// Creates an unused evaluation. The first check that binds it fixes its
+    /// generation and cache generation.
     pub fn new() -> Self {
-        LookupLimit {
-            num_lookups: 1,
-            timer: Instant::now(),
+        let now = Instant::now();
+        SpfEvaluation {
+            state: Mutex::new(SpfEvaluationState {
+                generation: next_spf_generation(),
+                cache_generation: 0,
+                lookups: 1,
+                started: now,
+                attempts: 0,
+                source: None,
+                identity: None,
+                completed: false,
+                terminal: None,
+                exhausted: false,
+            }),
         }
     }
 
+    /// Returns the generation fixed for the current evaluation.
+    pub fn generation(&self) -> u64 {
+        self.lock_state().generation
+    }
+
+    /// Returns the cache generation observed when the current evaluation
+    /// started. It is `0` until a cache is bound and stays fixed across
+    /// retries even if the cache recovers an answer.
+    pub fn cache_generation(&self) -> u64 {
+        self.lock_state().cache_generation
+    }
+
+    fn bind(&self, identity: SpfEvaluationIdentity, cache_generation: u64) {
+        let mut state = self.lock_state();
+        let now = Instant::now();
+
+        if !state.completed && state.identity.as_ref() == Some(&identity) {
+            return;
+        }
+
+        state.generation = next_spf_generation();
+        state.cache_generation = cache_generation;
+        state.lookups = 1;
+        state.started = now;
+        state.attempts = 0;
+        state.source = None;
+        state.identity = Some(identity);
+        state.completed = false;
+        state.terminal = None;
+        state.exhausted = false;
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, SpfEvaluationState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn terminal_result(&self) -> Option<SpfResult> {
+        self.lock_state().terminal
+    }
+
+    fn note_attempt(&self) {
+        let mut state = self.lock_state();
+        state.attempts = state.attempts.saturating_add(1);
+    }
+
+    fn start_check(&self, domain: &str) {
+        let mut state = self.lock_state();
+        state.attempts = state.attempts.saturating_add(1);
+        state.source = Some(domain.into());
+    }
+
+    fn set_source(&self, source: &str) {
+        let mut state = self.lock_state();
+        state.source = Some(source.into());
+    }
+
     #[inline(always)]
-    fn can_lookup(&mut self) -> bool {
-        if self.num_lookups <= 10 && self.timer.elapsed().as_secs() < 20 {
-            self.num_lookups += 1;
+    fn can_lookup(&self) -> bool {
+        let mut state = self.lock_state();
+        if state.terminal.is_some() {
+            state.exhausted = true;
+            return false;
+        }
+        if state.lookups <= SPF_QUERY_LIMIT
+            && state.started.elapsed().as_secs() < SPF_EVALUATION_SECONDS
+        {
+            state.lookups += 1;
             true
         } else {
+            state.exhausted = true;
             false
+        }
+    }
+
+    fn finish(&self, output: &SpfOutput) {
+        let mut state = self.lock_state();
+        if output.result() == SpfResult::TempError {
+            // A transient failure is resumable. Keep the consumed budget so a
+            // retry or cache recovery cannot start with a fresh ten.
+            return;
+        }
+        if output.result() == SpfResult::PermError
+            && (state.exhausted || state.terminal.is_some())
+        {
+            state.terminal = Some(SpfResult::PermError);
+        } else {
+            state.completed = true;
+            state.terminal = None;
+        }
+    }
+
+    fn report(&self, qualifier: SpfResult) -> SpfEvaluationReport {
+        let state = self.lock_state();
+        SpfEvaluationReport {
+            generation: state.generation,
+            attempts: state.attempts,
+            query_limit: SPF_QUERY_LIMIT,
+            queries_used: state.lookups.saturating_sub(1),
+            cache_generation: state.cache_generation,
+            source: state.source.as_ref().map(|source| source.to_string()),
+            qualifier,
         }
     }
 }
@@ -782,7 +1019,7 @@ mod test {
         spf::{Macro, SpfRecord},
     };
 
-    use super::SpfParameters;
+    use super::{SpfEvaluation, SpfParameters};
 
     #[tokio::test]
     async fn spf_verify() {
@@ -920,5 +1157,146 @@ mod test {
                 }
             }
         }
+    }
+
+    // A timeout must not turn a retry into a second ten-lookup budget. The
+    // recovered include is intentionally unreachable: consuming the tenth
+    // mechanism in the first attempt leaves no room for it when the same
+    // evaluation is resumed.
+    #[tokio::test]
+    async fn retry_keeps_query_budget_and_source() {
+        let resolver = MessageAuthenticator::new_system_conf().unwrap();
+        let caches = DummyCaches::new();
+        let valid_until = Instant::now() + Duration::from_secs(30);
+        let root = "spf-retry-budget.test.org";
+        let timeout_name = "spf-retry-inc10._dns_error.test.org";
+        let mut record = String::from("v=spf1");
+        for index in 0..9 {
+            let name = format!("spf-retry-inc{index}.test.org");
+            caches.txt_add(
+                name.clone(),
+                SpfRecord::parse(b"v=spf1 -all"),
+                valid_until,
+            );
+            record.push_str(&format!(" include:{name}"));
+        }
+        record.push_str(&format!(" include:{timeout_name} -all"));
+        caches.txt_add(root, SpfRecord::parse(record.as_bytes()), valid_until);
+
+        let ip: IpAddr = "192.168.1.5".parse().unwrap();
+        let sender = format!("sender@{root}");
+        let params = SpfParameters::mail_from(ip, root, "mail.test.org", &sender);
+        let evaluation = SpfEvaluation::new();
+
+        let first = resolver
+            .check_host_with(caches.parameters(params), &evaluation)
+            .await;
+        assert_eq!(first.result(), SpfResult::TempError);
+        let first_report = first.evaluation().expect("first evaluation").clone();
+        assert_eq!(first_report.queries_used(), 10);
+        assert_eq!(first_report.query_limit(), 10);
+        assert_eq!(first_report.source(), Some(root));
+        assert_eq!(first_report.qualifier(), SpfResult::TempError);
+
+        // Cache recovery makes the previously transient include available.
+        caches.txt_add(timeout_name, SpfRecord::parse(b"v=spf1 +all"), valid_until);
+
+        let second = resolver
+            .check_host_with(caches.parameters(params), &evaluation)
+            .await;
+        assert_eq!(second.result(), SpfResult::PermError);
+        let second_report = second.evaluation().expect("second evaluation");
+        assert_eq!(second_report.generation(), first_report.generation());
+        assert_eq!(second_report.queries_used(), first_report.queries_used());
+        assert_eq!(second_report.query_limit(), first_report.query_limit());
+        assert_eq!(second_report.source(), first_report.source());
+        assert_eq!(second_report.cache_generation(), first_report.cache_generation());
+        assert_eq!(second_report.qualifier(), SpfResult::PermError);
+        assert_eq!(second_report.attempts(), 2);
+    }
+
+    // A transient error remains a real Temperror. If the cache recovers while
+    // the evaluation still has budget, the retry may finish normally and must
+    // keep the same generation, source and cache generation.
+    #[tokio::test]
+    async fn cache_recovery_resumes_same_evaluation() {
+        let resolver = MessageAuthenticator::new_system_conf().unwrap();
+        let caches = DummyCaches::new();
+        let valid_until = Instant::now() + Duration::from_secs(30);
+        let root = "spf-cache-recovery.test.org";
+        let target = "spf-cache-recovery._dns_error.test.org";
+        caches.txt_add(
+            root,
+            SpfRecord::parse(format!("v=spf1 include:{target} -all").as_bytes()),
+            valid_until,
+        );
+
+        let ip: IpAddr = "192.168.1.5".parse().unwrap();
+        let sender = format!("sender@{root}");
+        let params = SpfParameters::mail_from(ip, root, "mail.test.org", &sender);
+        let evaluation = SpfEvaluation::new();
+
+        let first = resolver
+            .check_host_with(caches.parameters(params), &evaluation)
+            .await;
+        assert_eq!(first.result(), SpfResult::TempError);
+        let first_report = first.evaluation().expect("first evaluation").clone();
+        assert_eq!(first_report.queries_used(), 1);
+
+        caches.txt_add(target, SpfRecord::parse(b"v=spf1 +all"), valid_until);
+
+        let second = resolver
+            .check_host_with(caches.parameters(params), &evaluation)
+            .await;
+        assert_eq!(second.result(), SpfResult::Pass);
+        let second_report = second.evaluation().expect("second evaluation");
+        assert_eq!(second_report.generation(), first_report.generation());
+        assert_eq!(second_report.source(), Some(root));
+        assert_eq!(second_report.qualifier(), SpfResult::Pass);
+        assert_eq!(second_report.cache_generation(), first_report.cache_generation());
+        assert_eq!(second_report.attempts(), 2);
+        assert_eq!(second_report.queries_used(), 2);
+    }
+
+    // HELO and MAIL FROM are separate check_host evaluations under RFC
+    // 7208. A record that consumes all ten mechanisms must still be evaluated
+    // with a fresh budget for the second identity, and the reported source,
+    // budget and qualifier must describe that final identity.
+    #[tokio::test]
+    async fn verify_identities_keep_separate_budgets() {
+        let resolver = MessageAuthenticator::new_system_conf().unwrap();
+        let caches = DummyCaches::new();
+        let valid_until = Instant::now() + Duration::from_secs(30);
+        let root = "spf-verify-budget.test.org";
+
+        let mut record = String::from("v=spf1");
+        for index in 0..10 {
+            let name = format!("spf-verify-inc{index}.test.org");
+            caches.txt_add(
+                name.clone(),
+                SpfRecord::parse(b"v=spf1 -all"),
+                valid_until,
+            );
+            record.push_str(&format!(" include:{name}"));
+        }
+        record.push_str(" ~all");
+        caches.txt_add(root, SpfRecord::parse(record.as_bytes()), valid_until);
+
+        let sender = format!("sender@{root}");
+        let output = resolver
+            .verify_spf(caches.parameters(SpfParameters::helo_and_mail_from(
+                "192.168.1.5".parse().unwrap(),
+                root,
+                "mail.test.org",
+                &sender,
+            )))
+            .await;
+
+        assert_eq!(output.result(), SpfResult::SoftFail);
+        let report = output.evaluation().expect("evaluation");
+        assert_eq!(report.queries_used(), 10);
+        assert_eq!(report.source(), Some(root));
+        assert_eq!(report.qualifier(), SpfResult::SoftFail);
+        assert_eq!(report.attempts(), 1);
     }
 }

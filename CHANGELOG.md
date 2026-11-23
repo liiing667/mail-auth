@@ -9,6 +9,7 @@ All notable changes to this project will be documented in this file. This projec
 - DKIM2: `Dkim2Signer::sign_streaming` returns a `Dkim2SigningStream`, which signs a message fed in chunks while buffering only its header section, as `DkimSigningStream` does for DKIM1 (#66).
 - `stream::MessageStream` parses a message fed in chunks into a `StreamedMessage`, which buffers only the header section and keeps the body as the hashes that DKIM, ARC and DKIM2 need. Its `message()` works with `verify_dkim`, `verify_arc`, `verify_dkim2`, DMARC and `ArcSealer::seal`; an operation that needs the body, or a hash the stream did not compute, fails with `Error::BodyNotAvailable` or `Dkim2Error::BodyNotAvailable` (#68).
 - DKIM2: `Dkim2Signer::sign_message` and `sign_revised_message` sign already parsed messages, including streamed ones (#68).
+- SPF: `SpfEvaluation` is a resumable evaluation that fixes the source record, ten-query budget, cache generation and final qualifier. `check_host_with` reuses it for retries, and `SpfOutput::evaluation` reports the frozen state.
 
 ### Changed
 - The `aws-lc-rs` feature no longer enables the operating system's certificate store for TLS resolvers; it moved to the new `rustls-platform-verifier` feature, enabled by default. Builds with `default-features = false` that use TLS resolvers must enable `rustls-platform-verifier` or `webpki-roots` (#65).
@@ -18,6 +19,7 @@ All notable changes to this project will be documented in this file. This projec
 - DKIM1: `DkimSigningStream` hashed the body from the first `\r\n\r\n` instead of where the header section ends, so a header line without a colon or a bare LF empty line produced a body hash that did not verify.
 - DKIM2: a verification proof was accepted as covering a message parsed with `prepend_headers` it was not made for, so `Dkim2Signer` signed it without a new `Message-Instance` and the chain failed at the next hop (#69).
 - SPF: the `ptr` mechanism did not match a PTR name equal to `<target-name>`, or a subdomain of a macro-expanded `<target-name>`, because the trailing dot of the PTR record or of the expanded name was compared (#71).
+- SPF: a transient DNS error let a retry start a fresh ten-query budget. Reusing an `SpfEvaluation` for the retry now keeps the consumed budget, source record and cache generation, so a recovered include beyond the limit is rejected with `permerror`. HELO and MAIL FROM remain separate RFC 7208 checks.
 
 ## [0.15.1] - 2026-10-30
 

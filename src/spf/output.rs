@@ -39,6 +39,78 @@ pub enum SpfResult {
     None,
 }
 
+/// Snapshot of the state that was fixed for one SPF evaluation.
+///
+/// A `check_host()` call has one report. [`verify_spf`](crate::MessageAuthenticator::verify_spf)
+/// checks HELO and MAIL FROM as separate evaluations under RFC 7208 and
+/// returns the report of the identity whose output is returned.
+///
+/// The report is attached to [`SpfOutput`] and stays readable after the
+/// evaluation has finished. It is not part of [`SpfOutput`] equality, so
+/// synthetic outputs built with [`SpfOutput::new`] compare as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpfEvaluationReport {
+    pub(crate) generation: u64,
+    pub(crate) attempts: u32,
+    pub(crate) query_limit: u32,
+    pub(crate) queries_used: u32,
+    pub(crate) cache_generation: u64,
+    pub(crate) source: Option<String>,
+    pub(crate) qualifier: SpfResult,
+}
+
+impl SpfEvaluationReport {
+    /// Returns the unique generation of this evaluation.
+    ///
+    /// Retries of the same check reuse the generation and its budget.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns how many checks were run in this evaluation. Retrying the same
+    /// identity increments the count; a different identity starts a new
+    /// evaluation and resets it.
+    pub fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    /// Returns the number of DNS-querying mechanisms permitted by the
+    /// evaluation (ten).
+    pub fn query_limit(&self) -> u32 {
+        self.query_limit
+    }
+
+    /// Returns how many DNS-querying mechanisms this evaluation has consumed.
+    /// The initial TXT lookup of the domain is not counted, matching RFC
+    /// 7208 Section 4.6.4.
+    pub fn queries_used(&self) -> u32 {
+        self.queries_used
+    }
+
+    /// Returns the number of querying mechanisms still available. Retries of
+    /// the same evaluation never increase this value.
+    pub fn queries_remaining(&self) -> u32 {
+        self.query_limit.saturating_sub(self.queries_used)
+    }
+
+    /// Returns the opaque generation of the DNS cache used by the
+    /// evaluation. It is `0` when the check ran without a cache.
+    pub fn cache_generation(&self) -> u64 {
+        self.cache_generation
+    }
+
+    /// Returns the domain of the SPF record that was being evaluated when
+    /// the final qualifier was decided (or when the check failed).
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
+    /// Returns the qualifier that ended the evaluation.
+    pub fn qualifier(&self) -> SpfResult {
+        self.qualifier
+    }
+}
+
 /// The outcome of an SPF check.
 ///
 /// Returned by [`MessageAuthenticator::verify_spf`] and
@@ -58,6 +130,7 @@ pub struct SpfOutput {
     pub(crate) report: Option<String>,
     pub(crate) explanation: Option<String>,
     pub(crate) identity: Option<SpfIdentity>,
+    pub(crate) evaluation: Option<SpfEvaluationReport>,
 }
 
 impl PartialEq for SpfOutput {
@@ -103,6 +176,7 @@ impl SpfOutput {
             explanation: None,
             domain,
             identity: None,
+            evaluation: None,
         }
     }
 
@@ -147,6 +221,11 @@ impl SpfOutput {
         self
     }
 
+    pub(crate) fn with_evaluation(mut self, evaluation: SpfEvaluationReport) -> Self {
+        self.evaluation = Some(evaluation);
+        self
+    }
+
     /// Sets the explanation string (RFC 7208, Section 6.2).
     pub fn with_explanation(mut self, explanation: String) -> Self {
         self.explanation = explanation.into();
@@ -175,6 +254,15 @@ impl SpfOutput {
     pub fn report_address(&self) -> Option<&str> {
         self.report.as_deref()
     }
+
+    /// Returns the state fixed for this SPF evaluation: its generation,
+    /// source record, cache generation, query budget and final qualifier.
+    ///
+    /// Returns `None` for an output built with [`SpfOutput::new`] rather than
+    /// returned by a verifier.
+    pub fn evaluation(&self) -> Option<&SpfEvaluationReport> {
+        self.evaluation.as_ref()
+    }
 }
 
 impl Default for SpfOutput {
@@ -185,6 +273,7 @@ impl Default for SpfOutput {
             report: Default::default(),
             explanation: Default::default(),
             identity: None,
+            evaluation: None,
         }
     }
 }

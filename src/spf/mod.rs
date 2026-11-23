@@ -31,7 +31,8 @@ pub mod parse;
 pub mod verify;
 
 pub(crate) use output::SpfIdentity;
-pub use output::{SpfOutput, SpfResult};
+pub use output::{SpfEvaluationReport, SpfOutput, SpfResult};
+pub use verify::SpfEvaluation;
 
 use std::{
     borrow::Cow,

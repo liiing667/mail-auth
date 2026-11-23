@@ -147,6 +147,7 @@ fn authentication_results() {
             report: None,
             explanation: None,
             identity: None,
+            evaluation: None,
         };
         auth_results = auth_results.with_spf_result(&output, &params);
         let received_spf = ReceivedSpf::new(&output, &params);
@@ -420,6 +421,7 @@ fn spf_result_header_injection() {
         report: None,
         explanation: None,
         identity: None,
+        evaluation: None,
     };
     let auth_results = AuthenticationResults::new("mx.example.org").with_spf_result(
         &spf,
@@ -470,6 +472,7 @@ fn received_spf_header_injection() {
         report: None,
         explanation: None,
         identity: None,
+        evaluation: None,
     };
     let received_spf = ReceivedSpf::new(
         &spf,

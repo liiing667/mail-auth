@@ -31,7 +31,20 @@ pub mod parse;
 pub mod verify;
 
 pub(crate) use output::SpfIdentity;
-pub use output::{SpfOutput, SpfResult};
+pub use output::{
+    SpfEvaluationReport, SpfOutput, SpfReport, SpfResult, SpfTransactionReport,
+};
+pub use verify::SpfEvaluation;
+
+/// Alias for [`SpfEvaluation`], matching the transaction terminology used by
+/// the verifier.
+pub type SpfTransaction = SpfEvaluation;
+
+/// Alias for [`SpfOutput`].
+pub type SpfEvaluationOutput = SpfOutput;
+
+/// Alias for [`SpfOutput`].
+pub type SpfTransactionOutput = SpfOutput;
 
 use std::{
     borrow::Cow,

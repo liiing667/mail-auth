@@ -129,6 +129,7 @@ async fn dmarc_verify_alignment() {
             report: None,
             explanation: None,
             identity: None,
+            evaluation: None,
         };
         let result = resolver
             .verify_dmarc(caches.parameters(DmarcParameters::new(
@@ -317,6 +318,7 @@ async fn dmarc_verify_temp_errors() {
             report: None,
             explanation: None,
             identity: None,
+            evaluation: None,
         };
         let result = resolver
             .verify_dmarc(caches.parameters(DmarcParameters::new(
@@ -424,6 +426,7 @@ async fn verify_aligned(
         report: None,
         explanation: None,
         identity: None,
+        evaluation: None,
     };
     resolver
         .verify_dmarc(caches.parameters(DmarcParameters::new(
@@ -518,6 +521,7 @@ async fn dmarc_verify_dkim2() {
             report: None,
             explanation: None,
             identity: None,
+            evaluation: None,
         };
         let result = resolver
             .verify_dmarc(

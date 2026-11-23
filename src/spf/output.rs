@@ -39,6 +39,138 @@ pub enum SpfResult {
     None,
 }
 
+/// Snapshot of the state that was fixed for one SPF evaluation.
+///
+/// A `check_host()` call has one report. [`verify_spf`](crate::MessageAuthenticator::verify_spf)
+/// checks HELO and MAIL FROM as separate evaluations under RFC 7208 and
+/// returns the report of the identity whose output is returned.
+///
+/// The report is attached to [`SpfOutput`] and stays readable after the
+/// evaluation has finished. It is not part of [`SpfOutput`] equality, so
+/// synthetic outputs built with [`SpfOutput::new`] compare as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpfEvaluationReport {
+    /// The unique generation of this evaluation.
+    pub generation: u64,
+    /// How many checks ran in this evaluation.
+    pub attempts: u32,
+    /// The number of DNS-querying mechanisms permitted by the evaluation.
+    pub query_limit: u32,
+    /// How many DNS-querying mechanisms the evaluation has consumed.
+    pub queries_used: u32,
+    /// The opaque generation of the DNS cache used by the evaluation.
+    pub cache_generation: u64,
+    /// The domain of the SPF record that produced the final result.
+    pub source: Option<String>,
+    /// The last DNS key looked up by the evaluation.
+    pub dns_key: Option<String>,
+    /// The qualifier that ended the evaluation.
+    pub qualifier: SpfResult,
+}
+
+impl Default for SpfEvaluationReport {
+    fn default() -> Self {
+        SpfEvaluationReport {
+            generation: 0,
+            attempts: 0,
+            query_limit: 10,
+            queries_used: 0,
+            cache_generation: 0,
+            source: None,
+            dns_key: None,
+            qualifier: SpfResult::None,
+        }
+    }
+}
+
+impl SpfEvaluationReport {
+    /// Returns the unique generation of this evaluation.
+    ///
+    /// Retries of the same check reuse the generation and its budget.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Alias for [`SpfEvaluationReport::generation`].
+    pub fn transaction_generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns how many checks were run in this evaluation. Retrying the same
+    /// identity increments the count; a different identity starts a new
+    /// evaluation and resets it.
+    pub fn attempts(&self) -> u32 {
+        self.attempts
+    }
+
+    /// Returns the number of DNS-querying mechanisms permitted by the
+    /// evaluation (ten).
+    pub fn query_limit(&self) -> u32 {
+        self.query_limit
+    }
+
+    /// Returns how many DNS-querying mechanisms this evaluation has consumed.
+    /// The initial TXT lookup of the domain is not counted, matching RFC
+    /// 7208 Section 4.6.4.
+    pub fn queries_used(&self) -> u32 {
+        self.queries_used
+    }
+
+    /// Returns the number of querying mechanisms still available. Retries of
+    /// the same evaluation never increase this value.
+    pub fn queries_remaining(&self) -> u32 {
+        self.query_limit.saturating_sub(self.queries_used)
+    }
+
+    /// Returns the opaque generation of the DNS cache used by the
+    /// evaluation. It is `0` when the check ran without a cache.
+    pub fn cache_generation(&self) -> u64 {
+        self.cache_generation
+    }
+
+    /// Returns the domain of the SPF record that was being evaluated when
+    /// the final qualifier was decided (or when the check failed).
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
+    /// Alias for [`SpfEvaluationReport::source`], matching the macro source
+    /// terminology used by the evaluator.
+    pub fn macro_source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
+    /// Alias for [`SpfEvaluationReport::source`].
+    pub fn record_source(&self) -> Option<&str> {
+        self.source.as_deref()
+    }
+
+    /// Returns the last DNS key looked up by this evaluation.
+    ///
+    /// The key is the name produced by macro expansion for the last TXT, MX,
+    /// A or AAAA lookup, or the client address for a PTR lookup. Returns
+    /// `None` before any lookup has run.
+    pub fn dns_key(&self) -> Option<&str> {
+        self.dns_key.as_deref()
+    }
+
+    /// Returns the qualifier that ended the evaluation.
+    pub fn qualifier(&self) -> SpfResult {
+        self.qualifier
+    }
+
+    /// Alias for [`SpfEvaluationReport::qualifier`].
+    pub fn result(&self) -> SpfResult {
+        self.qualifier
+    }
+}
+
+/// Alias for [`SpfEvaluationReport`].
+pub type SpfReport = SpfEvaluationReport;
+
+/// Alias for [`SpfEvaluationReport`].
+pub type SpfTransactionReport = SpfEvaluationReport;
+
 /// The outcome of an SPF check.
 ///
 /// Returned by [`MessageAuthenticator::verify_spf`] and
@@ -58,6 +190,7 @@ pub struct SpfOutput {
     pub(crate) report: Option<String>,
     pub(crate) explanation: Option<String>,
     pub(crate) identity: Option<SpfIdentity>,
+    pub(crate) evaluation: Option<SpfEvaluationReport>,
 }
 
 impl PartialEq for SpfOutput {
@@ -103,6 +236,7 @@ impl SpfOutput {
             explanation: None,
             domain,
             identity: None,
+            evaluation: None,
         }
     }
 
@@ -147,6 +281,11 @@ impl SpfOutput {
         self
     }
 
+    pub(crate) fn with_evaluation(mut self, evaluation: SpfEvaluationReport) -> Self {
+        self.evaluation = Some(evaluation);
+        self
+    }
+
     /// Sets the explanation string (RFC 7208, Section 6.2).
     pub fn with_explanation(mut self, explanation: String) -> Self {
         self.explanation = explanation.into();
@@ -175,6 +314,62 @@ impl SpfOutput {
     pub fn report_address(&self) -> Option<&str> {
         self.report.as_deref()
     }
+
+    /// Returns the state fixed for this SPF evaluation: its generation,
+    /// source record, cache generation, query budget and final qualifier.
+    ///
+    /// Returns `None` for an output built with [`SpfOutput::new`] rather than
+    /// returned by a verifier.
+    pub fn evaluation(&self) -> Option<&SpfEvaluationReport> {
+        self.evaluation.as_ref()
+    }
+
+    /// Alias for [`SpfOutput::evaluation`].
+    pub fn evaluation_report(&self) -> Option<&SpfEvaluationReport> {
+        self.evaluation.as_ref()
+    }
+
+    /// Alias for [`SpfOutput::evaluation`] returning an owned snapshot.
+    pub fn transaction(&self) -> Option<SpfEvaluationReport> {
+        self.evaluation.clone()
+    }
+
+    /// Returns the generation of the evaluation attached to this output, or
+    /// `0` for a synthetic output.
+    pub fn transaction_generation(&self) -> u64 {
+        self.evaluation
+            .as_ref()
+            .map_or(0, |evaluation| evaluation.generation())
+    }
+
+    /// Returns the number of attempts of the evaluation attached to this
+    /// output, or `0` for a synthetic output.
+    pub fn attempts(&self) -> u32 {
+        self.evaluation
+            .as_ref()
+            .map_or(0, |evaluation| evaluation.attempts())
+    }
+
+    /// Returns the cache generation of the evaluation attached to this
+    /// output, or `0` for a synthetic output.
+    pub fn cache_generation(&self) -> u64 {
+        self.evaluation
+            .as_ref()
+            .map_or(0, |evaluation| evaluation.cache_generation())
+    }
+
+    /// Returns the source record domain of the evaluation attached to this
+    /// output, or `None` for a synthetic output.
+    pub fn source(&self) -> Option<&str> {
+        self.evaluation
+            .as_ref()
+            .and_then(|evaluation| evaluation.source())
+    }
+
+    /// Alias for [`SpfOutput::source`].
+    pub fn macro_source(&self) -> Option<&str> {
+        self.source()
+    }
 }
 
 impl Default for SpfOutput {
@@ -185,6 +380,7 @@ impl Default for SpfOutput {
             report: Default::default(),
             explanation: Default::default(),
             identity: None,
+            evaluation: None,
         }
     }
 }

@@ -119,6 +119,21 @@ impl MessageAuthenticator {
         C: DnsCache + 'x,
     {
         let params = params.into();
+        let identity = params.input.message.identity();
+        let mut output = self.verify_dmarc_inner(params).await;
+        if output.message.is_none() {
+            output.message = Some(identity);
+        }
+        output
+    }
+
+    async fn verify_dmarc_inner<'x, C>(
+        &self,
+        params: Parameters<'x, DmarcParameters<'x>, C>,
+    ) -> DmarcOutput
+    where
+        C: DnsCache + 'x,
+    {
         let message = params.input.message;
         let dkim_output = params.input.dkim_output;
         let dkim2_output = params.input.dkim2_output;
@@ -204,6 +219,7 @@ impl MessageAuthenticator {
             domain: rfc5322_from_domain.to_string(),
             policy,
             record: None,
+            message: None,
         };
 
         let dkim_signatures = dkim_output

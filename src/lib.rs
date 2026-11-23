@@ -61,5 +61,5 @@ pub use dns::{
 };
 pub use error::{DnsError, Error, Result};
 pub use iprev::{IprevOutput, IprevResult};
-pub use message::AuthenticatedMessage;
+pub use message::{AuthenticatedMessage, MessageIdentity};
 pub use spf::{SpfOutput, SpfResult};

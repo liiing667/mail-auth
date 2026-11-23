@@ -22,11 +22,12 @@
 use crate::{ArcOutput, arc::ArcError};
 use crate::{
     Dkim2Result, DkimOutput, DkimResult, DmarcOutput, DmarcResult, DnsError, Error, IprevOutput,
-    IprevResult, SpfOutput, SpfResult,
+    IprevResult, MessageIdentity, SpfOutput, SpfResult,
     crypto::CryptoError,
     dkim::DkimError,
     dkim2::{Dkim2Output, Verification},
     dmarc::Policy,
+    dns::to_a_label,
     headers::{HeaderWriter, IntegerBuffer, Writer},
     spf::{SpfIdentity, verify::SpfParameters},
 };
@@ -45,6 +46,13 @@ use std::{
 /// that takes `&mut self`. Results are written in the order they are added.
 /// A header with no results is written as `Authentication-Results:
 /// <authserv-id>; none`.
+///
+/// The builder keeps one result per method identity. Adding the result of a
+/// retried method replaces its earlier entry instead of leaving a stale
+/// `pass` behind. Use [`new_for`](Self::new_for) (or
+/// [`with_message`](Self::with_message)) to bind the header to a parsed
+/// message; outputs produced for another message revision are then reported
+/// as `none` rather than relabelled as this message's result.
 ///
 /// The [`Display`] implementation renders the header value without the field
 /// name and without the trailing CRLF.
@@ -77,10 +85,41 @@ use std::{
 ///     .to_header();
 /// # }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct AuthenticationResults<'x> {
     pub(crate) hostname: &'x str,
     pub(crate) auth_results: String,
+    /// Identity of the message this header is being built for, once known.
+    pub(crate) message: Option<MessageIdentity>,
+    /// The RFC 5322 `From` domain of the message, when known.
+    pub(crate) from_domain: Option<String>,
+    entries: Vec<AuthResultEntry>,
+}
+
+impl PartialEq for AuthenticationResults<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.hostname == other.hostname && self.auth_results == other.auth_results
+    }
+}
+
+impl Eq for AuthenticationResults<'_> {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthResultEntry {
+    key: AuthResultKey,
+    body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthResultKey {
+    Dkim(String),
+    Dkim2(String),
+    Spf(String),
+    DmarcMessage(MessageIdentity),
+    DmarcDomain(String),
+    #[cfg(feature = "arc")]
+    Arc(IpAddr),
+    Iprev(IpAddr),
 }
 
 /// A `Received-SPF` header (RFC 7208 Section 9.1).
@@ -100,11 +139,297 @@ impl<'x> AuthenticationResults<'x> {
         AuthenticationResults {
             hostname,
             auth_results: String::with_capacity(256),
+            message: None,
+            from_domain: None,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Creates an empty header bound to `message`.
+    ///
+    /// Results added from another message revision are not reported as this
+    /// message's results. The same is true for the consuming
+    /// [`with_message`](Self::with_message) form.
+    pub fn new_for(
+        hostname: &'x str,
+        message: &crate::AuthenticatedMessage<'_>,
+    ) -> AuthenticationResults<'x> {
+        let mut results = AuthenticationResults::new(hostname);
+        results.bind_message(message);
+        results
+    }
+
+    /// Alias for [`new_for`](Self::new_for).
+    pub fn for_message(
+        hostname: &'x str,
+        message: &crate::AuthenticatedMessage<'_>,
+    ) -> AuthenticationResults<'x> {
+        Self::new_for(hostname, message)
+    }
+
+    /// Alias for [`new_for`](Self::new_for).
+    pub fn from_message(
+        hostname: &'x str,
+        message: &crate::AuthenticatedMessage<'_>,
+    ) -> AuthenticationResults<'x> {
+        Self::new_for(hostname, message)
+    }
+
+    /// Alias for [`new_for`](Self::new_for).
+    pub fn new_with_message(
+        hostname: &'x str,
+        message: &crate::AuthenticatedMessage<'_>,
+    ) -> AuthenticationResults<'x> {
+        Self::new_for(hostname, message)
+    }
+
+    /// Binds this header to `message` and returns it.
+    pub fn with_message(mut self, message: &crate::AuthenticatedMessage<'_>) -> Self {
+        self.bind_message(message);
+        self
+    }
+
+    /// Alias for [`with_message`](Self::with_message).
+    pub fn with_authenticated_message(
+        self,
+        message: &crate::AuthenticatedMessage<'_>,
+    ) -> Self {
+        self.with_message(message)
+    }
+
+    /// Fixes the message instance that this header describes.
+    pub fn bind_message(&mut self, message: &crate::AuthenticatedMessage<'_>) -> &mut Self {
+        self.message = Some(message.identity());
+        if self.from_domain.is_none()
+            && let Some(from) = message.from.first()
+            && let Some((_, domain)) = from.rsplit_once('@')
+        {
+            self.from_domain = Some(to_a_label(domain).into_owned());
+        }
+        self
+    }
+
+    /// Alias for [`bind_message`](Self::bind_message).
+    pub fn set_message(&mut self, message: &crate::AuthenticatedMessage<'_>) -> &mut Self {
+        self.bind_message(message)
+    }
+
+    /// Alias for [`bind_message`](Self::bind_message).
+    pub fn bind(&mut self, message: &crate::AuthenticatedMessage<'_>) -> &mut Self {
+        self.bind_message(message)
+    }
+
+    /// Returns the message identity fixed for this header, if any.
+    pub fn message_identity(&self) -> Option<MessageIdentity> {
+        self.message
+    }
+
+    /// Returns the RFC 5322 `From` domain this header reports, if known.
+    pub fn from_domain(&self) -> Option<&str> {
+        self.from_domain.as_deref()
+    }
+
+    /// Fixes the RFC 5322 `From` domain used by mismatch reporting.
+    pub fn with_from_domain(mut self, domain: &str) -> Self {
+        self.from_domain = Some(to_a_label(domain).into_owned());
+        self
+    }
+
+    /// Marks the header as complete. This is a no-op return of `self` that
+    /// makes the transactional usage explicit:
+    /// `AuthenticationResults::new_for(..).with_dkim_results(..).commit()`.
+    pub fn commit(self) -> Self {
+        self
+    }
+
+    /// Alias for [`commit`](Self::commit) on a borrowed builder.
+    pub fn commit_mut(&mut self) -> &mut Self {
+        self
+    }
+
+    /// Alias for [`commit`](Self::commit).
+    pub fn finish(self) -> Self {
+        self
+    }
+
+    /// Removes every result, leaving the header empty (rendered as `none`).
+    pub fn clear(&mut self) {
+        self.auth_results.clear();
+        self.entries.clear();
+        self.message = None;
+        self.from_domain = None;
+    }
+
+    /// Alias for [`clear`](Self::clear).
+    pub fn reset(&mut self) {
+        self.clear();
+    }
+
+    fn accept_message(&mut self, source: Option<MessageIdentity>) -> bool {
+        match (self.message, source) {
+            (Some(expected), Some(actual)) if expected != actual => false,
+            (None, Some(actual)) => {
+                self.message = Some(actual);
+                true
+            }
+            _ => true,
+        }
+    }
+
+    fn accept_dmarc_domain(&mut self, domain: &str) -> bool {
+        if domain.is_empty() {
+            return true;
+        }
+        match &self.from_domain {
+            Some(expected)
+                if !expected
+                    .trim_end_matches('.')
+                    .eq_ignore_ascii_case(domain.trim_end_matches('.')) =>
+            {
+                false
+            }
+            Some(_) => true,
+            None => {
+                self.from_domain = Some(domain.to_string());
+                true
+            }
+        }
+    }
+
+    fn commit_entry(&mut self, key: AuthResultKey, start: usize) {
+        let body = self.auth_results.split_off(start);
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.key == key) {
+            entry.body = body;
+        } else {
+            self.entries.push(AuthResultEntry { key, body });
+        }
+        self.rebuild();
+    }
+
+    fn remove_entries(&mut self, mut matches: impl FnMut(&AuthResultKey) -> bool) {
+        self.entries.retain(|entry| !matches(&entry.key));
+        self.rebuild();
+    }
+
+    fn rebuild(&mut self) {
+        self.auth_results.clear();
+        for entry in &self.entries {
+            self.auth_results.push_str(&entry.body);
+        }
+    }
+
+    fn dkim_key(dkim: &DkimOutput, anonymous: usize) -> AuthResultKey {
+        match &dkim.signature {
+            Some(signature) => {
+                let mut key = String::with_capacity(
+                    signature.d.len()
+                        + signature.s.len()
+                        + signature.i.len()
+                        + signature.b.len()
+                        + 8,
+                );
+                if dkim.is_atps {
+                    key.push_str("atps:");
+                } else {
+                    key.push_str("dkim:");
+                }
+                key.push_str(&signature.d);
+                key.push('\0');
+                key.push_str(&signature.s);
+                key.push('\0');
+                key.push_str(&signature.i);
+                key.push('\0');
+                base64::STANDARD.encode_append(signature.b.as_slice(), &mut key);
+                AuthResultKey::Dkim(key)
+            }
+            None => AuthResultKey::Dkim(format!("unparsed:{anonymous}")),
+        }
+    }
+
+    fn dkim2_key(dkim2: &Dkim2Output, anonymous: usize) -> AuthResultKey {
+        let link = if dkim2.verification() == Verification::Full {
+            dkim2
+                .chain()
+                .first()
+                .or_else(|| dkim2.chain().last())
+        } else {
+            dkim2.chain().first()
+        };
+        match link {
+            Some(link) => AuthResultKey::Dkim2(format!(
+                "{}:{}",
+                link.signature.d, link.signature.i
+            )),
+            None => AuthResultKey::Dkim2(format!("unparsed:{anonymous}")),
+        }
+    }
+
+    fn push_dkim_mismatch(&mut self, dkim: &DkimOutput, header_from: &str) {
+        self.auth_results.push_str(if dkim.is_atps {
+            ";\r\n\tdkim-atps=none (result belongs to another message instance)"
+        } else {
+            ";\r\n\tdkim=none (result belongs to another message instance)"
+        });
+        if let Some(signature) = &dkim.signature {
+            if !signature.i.is_empty() {
+                self.auth_results.push_str(" header.i=");
+                push_quoted_pvalue(&mut self.auth_results, &signature.i);
+            } else {
+                self.auth_results.push_str(" header.d=");
+                push_pvalue(&mut self.auth_results, &signature.d);
+            }
+            self.auth_results.push_str(" header.s=");
+            push_pvalue(&mut self.auth_results, &signature.s);
+            if let Some(prefix) = signature.b.get(..6) {
+                self.auth_results.push_str(" header.b=");
+                base64::STANDARD.encode_append(prefix, &mut self.auth_results);
+            }
+        }
+        if dkim.is_atps {
+            self.auth_results.push_str(" header.from=");
+            push_quoted_pvalue(&mut self.auth_results, header_from);
+        }
+    }
+
+    fn push_dmarc_mismatch(&mut self) {
+        self.auth_results
+            .push_str(";\r\n\tdmarc=none (result belongs to another message instance)");
+        if let Some(domain) = self.from_domain.clone() {
+            self.auth_results.push_str(" header.from=");
+            push_pvalue(&mut self.auth_results, &domain);
+        }
+        self.auth_results.push_str(" policy.dmarc=none");
+    }
+
+    fn push_spf_mismatch(&mut self, params: &SpfParameters<'_>) {
+        self.auth_results
+            .push_str(";\r\n\tspf=none (result belongs to another SPF evaluation)");
+        let helo_domain = sanitize_pvalue(params.helo_domain());
+        if let Some(from) = params.mail_from_address() {
+            self.auth_results.push_str(" smtp.mailfrom=");
+            if from.is_empty() {
+                self.auth_results.push_str("<>");
+            } else {
+                push_quoted_pvalue(&mut self.auth_results, from);
+            }
+        } else {
+            self.auth_results.push_str(" smtp.helo=");
+            self.auth_results.push_str(helo_domain.as_ref());
+        }
+    }
+
+    fn spf_key_for_params(params: &SpfParameters<'_>) -> AuthResultKey {
+        match params.mail_from_address() {
+            Some(from) => AuthResultKey::Spf(format!("mailfrom:{from}")),
+            None => {
+                AuthResultKey::Spf(format!("helo:{}", params.helo_domain().to_ascii_lowercase()))
+            }
         }
     }
 
     /// Adds one `dkim` entry per DKIM output. See
-    /// [`set_dkim_result`](Self::set_dkim_result).
+    /// [`set_dkim_result`](Self::set_dkim_result). An empty slice removes the
+    /// DKIM entries of an earlier verification attempt.
     pub fn with_dkim_results(mut self, dkim: &[DkimOutput], header_from: &str) -> Self {
         self.set_dkim_results(dkim, header_from);
         self
@@ -113,6 +438,11 @@ impl<'x> AuthenticationResults<'x> {
     /// Adds one `dkim` entry per DKIM output. See
     /// [`set_dkim_result`](Self::set_dkim_result).
     pub fn set_dkim_results(&mut self, dkim: &[DkimOutput], header_from: &str) {
+        if dkim.is_empty() {
+            // A retry of the DKIM verification that found no signatures must
+            // not leave the signatures of the earlier attempt behind.
+            self.remove_entries(|key| matches!(key, AuthResultKey::Dkim(_)));
+        }
         for dkim in dkim {
             self.set_dkim_result(dkim, header_from);
         }
@@ -134,6 +464,13 @@ impl<'x> AuthenticationResults<'x> {
     /// from `header_from`, the RFC 5322 `From` address. `header_from` is
     /// ignored for other results.
     pub fn set_dkim_result(&mut self, dkim: &DkimOutput, header_from: &str) {
+        let start = self.auth_results.len();
+        let key = Self::dkim_key(dkim, start);
+        if !self.accept_message(dkim.message) {
+            self.push_dkim_mismatch(dkim, header_from);
+            self.commit_entry(key, start);
+            return;
+        }
         if !dkim.is_atps {
             self.auth_results.push_str(";\r\n\tdkim=");
         } else {
@@ -160,6 +497,7 @@ impl<'x> AuthenticationResults<'x> {
             self.auth_results.push_str(" header.from=");
             push_quoted_pvalue(&mut self.auth_results, header_from);
         }
+        self.commit_entry(key, start);
     }
 
     /// Adds a `dkim2` entry. See [`set_dkim2_result`](Self::set_dkim2_result).
@@ -175,6 +513,8 @@ impl<'x> AuthenticationResults<'x> {
     /// chain passed, or of the first link that did not pass otherwise. Both
     /// are omitted for a provisional verification.
     pub fn set_dkim2_result(&mut self, dkim2: &Dkim2Output) {
+        let start = self.auth_results.len();
+        let key = Self::dkim2_key(dkim2, start);
         self.auth_results.push_str(";\r\n\tdkim2=");
         dkim2.result().as_auth_result(&mut self.auth_results);
 
@@ -195,6 +535,7 @@ impl<'x> AuthenticationResults<'x> {
             self.auth_results.push_str(" header.i=");
             push_integer(&mut self.auth_results, link.signature.i as u64);
         }
+        self.commit_entry(key, start);
     }
 
     /// Adds an `spf` entry. See [`set_spf_result`](Self::set_spf_result).
@@ -215,6 +556,14 @@ impl<'x> AuthenticationResults<'x> {
     /// (written as `<>` for the null reverse-path). A comment explaining the
     /// result, including the client IP address, precedes the property.
     pub fn set_spf_result(&mut self, spf: &SpfOutput, params: &SpfParameters<'_>) {
+        let start = self.auth_results.len();
+        let compatible = spf.is_for(params);
+        let key = Self::spf_key_for_params(params);
+        if !compatible {
+            self.push_spf_mismatch(params);
+            self.commit_entry(key, start);
+            return;
+        }
         let ip_addr = params.ip();
         let helo_domain = sanitize_pvalue(params.helo_domain());
         self.auth_results.push_str(";\r\n\tspf=");
@@ -246,6 +595,7 @@ impl<'x> AuthenticationResults<'x> {
                 }
             }
         }
+        self.commit_entry(key, start);
     }
 
     /// Adds an `arc` entry. See [`set_arc_result`](Self::set_arc_result).
@@ -260,10 +610,27 @@ impl<'x> AuthenticationResults<'x> {
     /// `smtp.remote-ip`.
     #[cfg(feature = "arc")]
     pub fn set_arc_result(&mut self, arc: &ArcOutput, remote_ip: IpAddr) {
+        let start = self.auth_results.len();
+        let mut key = AuthResultKey::Arc(remote_ip);
+        if !self.accept_message(arc.message) {
+            if let Some(previous) = self.entries.iter().find_map(|entry| match &entry.key {
+                AuthResultKey::Arc(_) => Some(entry.key.clone()),
+                _ => None,
+            }) {
+                key = previous;
+            }
+            self.auth_results
+                .push_str(";\r\n\tarc=none (result belongs to another message instance)");
+            self.auth_results.push_str(" smtp.remote-ip=");
+            push_ip_as_pvalue(&mut self.auth_results, remote_ip);
+            self.commit_entry(key, start);
+            return;
+        }
         self.auth_results.push_str(";\r\n\tarc=");
         arc.result.as_auth_result(&mut self.auth_results);
         self.auth_results.push_str(" smtp.remote-ip=");
         push_ip_as_pvalue(&mut self.auth_results, remote_ip);
+        self.commit_entry(key, start);
     }
 
     /// Adds a `dmarc` entry. See [`set_dmarc_result`](Self::set_dmarc_result).
@@ -279,6 +646,48 @@ impl<'x> AuthenticationResults<'x> {
     /// `policy.dmarc`, the policy published by that domain (`none`,
     /// `quarantine` or `reject`).
     pub fn set_dmarc_result(&mut self, dmarc: &DmarcOutput) {
+        let start = self.auth_results.len();
+        let mut key = match dmarc.message {
+            Some(identity) => AuthResultKey::DmarcMessage(identity),
+            None if dmarc.domain.is_empty() => {
+                self.entries
+                    .iter()
+                    .find_map(|entry| match &entry.key {
+                        AuthResultKey::DmarcMessage(_) | AuthResultKey::DmarcDomain(_) => {
+                            Some(entry.key.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        AuthResultKey::DmarcDomain(self.from_domain.clone().unwrap_or_default())
+                    })
+            }
+            None => AuthResultKey::DmarcDomain(
+                dmarc.domain
+                    .trim_end_matches('.')
+                    .to_ascii_lowercase(),
+            ),
+        };
+        let message_matches = self.accept_message(dmarc.message);
+        let domain_matches = !message_matches
+            || self.message.is_none()
+            || self.accept_dmarc_domain(&dmarc.domain);
+        if !message_matches || !domain_matches {
+            if let Some(previous) = self.entries.iter().find_map(|entry| match &entry.key {
+                AuthResultKey::DmarcMessage(_) | AuthResultKey::DmarcDomain(_) => {
+                    Some(entry.key.clone())
+                }
+                _ => None,
+            }) {
+                key = previous;
+            }
+            self.push_dmarc_mismatch();
+            self.commit_entry(key, start);
+            return;
+        }
+        if self.from_domain.is_none() && !dmarc.domain.is_empty() {
+            self.from_domain = Some(dmarc.domain.clone());
+        }
         self.auth_results.push_str(";\r\n\tdmarc=");
         match dmarc.mechanism_result() {
             Some(result) => result.as_auth_result(&mut self.auth_results),
@@ -291,6 +700,7 @@ impl<'x> AuthenticationResults<'x> {
             Policy::Reject => " policy.dmarc=reject",
             Policy::None | Policy::Unspecified => " policy.dmarc=none",
         });
+        self.commit_entry(key, start);
     }
 
     /// Adds an `iprev` entry. See [`set_iprev_result`](Self::set_iprev_result).
@@ -303,10 +713,13 @@ impl<'x> AuthenticationResults<'x> {
     /// `remote_ip` is the SMTP client address checked, reported as
     /// `policy.iprev`.
     pub fn set_iprev_result(&mut self, iprev: &IprevOutput, remote_ip: IpAddr) {
+        let start = self.auth_results.len();
+        let key = AuthResultKey::Iprev(remote_ip);
         self.auth_results.push_str(";\r\n\tiprev=");
         iprev.result.as_auth_result(&mut self.auth_results);
         self.auth_results.push_str(" policy.iprev=");
         push_ip_as_pvalue(&mut self.auth_results, remote_ip);
+        self.commit_entry(key, start);
     }
 }
 
@@ -377,8 +790,14 @@ impl ReceivedSpf {
             [POSTMASTER_AT, helo.as_ref()]
         };
 
-        spf.result
-            .as_spf_result(&mut received_spf, hostname, pieces, ip_addr);
+        if spf.is_for(params) {
+            spf.result
+                .as_spf_result(&mut received_spf, hostname, pieces, ip_addr);
+        } else {
+            received_spf.push_str("none (");
+            received_spf.push_str(hostname);
+            received_spf.push_str(": result belongs to another SPF evaluation)");
+        }
 
         received_spf.push_str("\r\n\treceiver=");
         received_spf.push_str(hostname);

@@ -122,6 +122,7 @@ async fn dmarc_verify_alignment() {
             signature: (&signature).into(),
             report: None,
             is_atps: false,
+            message: None,
         };
         let spf = SpfOutput {
             result: spf,
@@ -129,6 +130,7 @@ async fn dmarc_verify_alignment() {
             report: None,
             explanation: None,
             identity: None,
+            source: None,
         };
         let result = resolver
             .verify_dmarc(caches.parameters(DmarcParameters::new(
@@ -310,6 +312,7 @@ async fn dmarc_verify_temp_errors() {
             signature: (&signature).into(),
             report: None,
             is_atps: false,
+            message: None,
         };
         let spf = SpfOutput {
             result: spf,
@@ -317,6 +320,7 @@ async fn dmarc_verify_temp_errors() {
             report: None,
             explanation: None,
             identity: None,
+            source: None,
         };
         let result = resolver
             .verify_dmarc(caches.parameters(DmarcParameters::new(
@@ -424,6 +428,7 @@ async fn verify_aligned(
         report: None,
         explanation: None,
         identity: None,
+        source: None,
     };
     resolver
         .verify_dmarc(caches.parameters(DmarcParameters::new(
@@ -518,6 +523,7 @@ async fn dmarc_verify_dkim2() {
             report: None,
             explanation: None,
             identity: None,
+            source: None,
         };
         let result = resolver
             .verify_dmarc(

@@ -5,7 +5,7 @@
  */
 
 use super::{DmarcRecord, FailureOptions, Policy};
-use crate::{DnsError, Error};
+use crate::{DnsError, Error, MessageIdentity};
 use std::{fmt::Display, sync::Arc};
 
 /// The outcome of DMARC evaluation.
@@ -14,14 +14,29 @@ use std::{fmt::Display, sync::Arc};
 /// [`MessageAuthenticator::verify_dmarc`](crate::MessageAuthenticator::verify_dmarc).
 /// It holds the Author Domain, the policy to apply, the aligned SPF and DKIM
 /// results and the DMARC Policy Record that was applied, if any.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, Clone)]
 pub struct DmarcOutput {
     pub(crate) spf_result: DmarcResult,
     pub(crate) dkim_result: DmarcResult,
     pub(crate) domain: String,
     pub(crate) policy: Policy,
     pub(crate) record: Option<Arc<DmarcRecord>>,
+    /// Identity of the message revision this evaluation describes. `None`
+    /// for a synthetic or default output.
+    pub(crate) message: Option<MessageIdentity>,
 }
+
+impl PartialEq for DmarcOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.spf_result == other.spf_result
+            && self.dkim_result == other.dkim_result
+            && self.domain == other.domain
+            && self.policy == other.policy
+            && self.record == other.record
+    }
+}
+
+impl Eq for DmarcOutput {}
 
 /// A DMARC result (RFC 9989, Section 4.10), either for one mechanism
 /// ([`DmarcOutput::spf_result`], [`DmarcOutput::dkim_result`]) or overall
@@ -65,6 +80,7 @@ impl Default for DmarcOutput {
             record: None,
             spf_result: DmarcResult::None,
             dkim_result: DmarcResult::None,
+            message: None,
         }
     }
 }
@@ -88,6 +104,21 @@ impl DmarcOutput {
     pub(crate) fn with_record(mut self, record: Arc<DmarcRecord>) -> Self {
         self.record = record.into();
         self
+    }
+
+    /// Returns the identity of the message revision this evaluation belongs
+    /// to, or `None` for a synthetic output.
+    pub fn message_identity(&self) -> Option<MessageIdentity> {
+        self.message
+    }
+
+    /// Returns `true` when this evaluation was produced for `message`.
+    ///
+    /// An output without recorded identity returns `true`, so synthetic
+    /// outputs remain usable with the historical API.
+    pub fn is_for_message(&self, message: &crate::AuthenticatedMessage<'_>) -> bool {
+        self.message
+            .is_none_or(|identity| identity == message.identity())
     }
 
     /// Returns the Author Domain (the RFC5322.From domain, as an A-label), or

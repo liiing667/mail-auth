@@ -27,6 +27,75 @@ use mail_parser::{AddressList, HeaderForm, HeaderName, Message};
 
 const EXPECTED_HEADER_COUNT: usize = 32;
 
+/// An opaque identity for one parsed message revision.
+///
+/// The identity is derived from the message bytes, the parsed header sequence
+/// and the body hashes computed while parsing. Two messages that parse to the
+/// same revision (including a reparsed copy of the same bytes) have the same
+/// identity; a different message, or a message whose headers or body changed,
+/// does not. Result objects carry this identity so that authentication results
+/// from one message cannot be reported as the results of another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MessageIdentity {
+    digest: [u8; 16],
+    len: u64,
+}
+
+impl MessageIdentity {
+    /// Returns the opaque digest that identifies the message revision.
+    pub fn digest(&self) -> [u8; 16] {
+        self.digest
+    }
+
+    /// Returns the length in bytes of the message revision that was hashed.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Returns `true` when the identity was produced for an empty message.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+struct IdentityHasher {
+    first: u64,
+    second: u64,
+}
+
+impl IdentityHasher {
+    const OFFSET_FIRST: u64 = 0xcbf2_9ce4_8422_2325;
+    const OFFSET_SECOND: u64 = 0x8422_2325_cbf2_9ce4;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn new() -> Self {
+        IdentityHasher {
+            first: Self::OFFSET_FIRST,
+            second: Self::OFFSET_SECOND,
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.first ^= byte as u64;
+            self.first = self.first.wrapping_mul(Self::PRIME);
+            self.second ^= byte as u64;
+            self.second = self.second.rotate_left(5).wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn update_u64(&mut self, value: u64) {
+        self.update(&value.to_be_bytes());
+    }
+
+    fn finish(self) -> [u8; 16] {
+        let mut digest = [0u8; 16];
+        digest[..8].copy_from_slice(&self.first.to_be_bytes());
+        digest[8..].copy_from_slice(&self.second.to_be_bytes());
+        digest
+    }
+}
+
 /// An RFC 5322 message prepared for DKIM, DKIM2, ARC and DMARC verification.
 ///
 /// The message borrows the raw bytes it was parsed from. Parsing records the
@@ -119,6 +188,80 @@ impl<'x> TryFrom<&'x Vec<u8>> for AuthenticatedMessage<'x> {
 }
 
 impl<'x> AuthenticatedMessage<'x> {
+    /// Returns the identity of this exact parsed message revision.
+    ///
+    /// The identity covers the parsed header sequence (including any
+    /// `prepend_headers`), the body offset and the body hashes computed during
+    /// parsing. A verifier result records it so that
+    /// [`AuthenticationResults`](crate::AuthenticationResults) can reject an
+    /// output belonging to another message or an older revision.
+    pub fn identity(&self) -> MessageIdentity {
+        let mut hasher = IdentityHasher::new();
+        hasher.update_u64(self.raw_message.len() as u64);
+        hasher.update_u64(self.body_offset as u64);
+        hasher.update_u64(self.headers.len() as u64);
+        for (name, value) in &self.headers {
+            hasher.update_u64(name.len() as u64);
+            hasher.update(name);
+            hasher.update_u64(value.len() as u64);
+            hasher.update(value);
+        }
+        hasher.update_u64(self.body_hashes.len() as u64);
+        for (_, _, length, body_hash) in &self.body_hashes {
+            hasher.update_u64(*length);
+            hasher.update_u64(body_hash.len() as u64);
+            hasher.update(body_hash);
+        }
+        hasher.update_u64(self.dkim_headers.len() as u64);
+        hasher.update_u64(self.dkim2_signatures.len() as u64);
+        hasher.update_u64(self.dkim2_instances.len() as u64);
+        hasher.update_u64(self.errors.len() as u64);
+        hasher.update_u64(self.has_dkim_errors as u64);
+        hasher.update_u64(self.has_dkim2_errors as u64);
+        #[cfg(feature = "arc")]
+        {
+            hasher.update_u64(self.ams_headers.len() as u64);
+            hasher.update_u64(self.as_headers.len() as u64);
+            hasher.update_u64(self.aar_headers.len() as u64);
+            hasher.update_u64(self.has_arc_errors as u64);
+        }
+        if self.streamed_body.is_none() {
+            let body = self
+                .raw_message
+                .get(self.body_offset as usize..)
+                .unwrap_or_default();
+            hasher.update_u64(body.len() as u64);
+            hasher.update(body);
+        }
+        if let Some(body) = &self.streamed_body {
+            hasher.update_u64(body.len);
+            for digest in &body.dkim2 {
+                match digest {
+                    Some(digest) => {
+                        hasher.update_u64(1);
+                        let bytes: &[u8] = digest.as_ref();
+                        hasher.update(bytes);
+                    }
+                    None => hasher.update_u64(0),
+                }
+            }
+        }
+        MessageIdentity {
+            digest: hasher.finish(),
+            len: self.raw_message.len() as u64,
+        }
+    }
+
+    /// Alias for [`identity`](Self::identity).
+    pub fn message_instance(&self) -> MessageIdentity {
+        self.identity()
+    }
+
+    /// Alias for [`identity`](Self::identity).
+    pub fn fingerprint(&self) -> MessageIdentity {
+        self.identity()
+    }
+
     /// Parses a raw RFC 5322 message in strict mode.
     ///
     /// Equivalent to [`parse_with_opts(raw_message, None, true)`](Self::parse_with_opts).

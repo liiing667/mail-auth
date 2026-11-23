@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file. This projec
 - DKIM2: `MessageInstance::from_recipe` returns `Result<Option<MessageInstance>>`: it and `from_message` fail with `Error::BodyNotAvailable` for a streamed message without the body digest a new instance needs (#68).
 
 ### Fixed
+- Authentication-Results: an output from another message revision, or a result added again after a retry, could leave an earlier `dmarc=pass` (or another stale method result) in the header. `AuthenticationResults` now fixes the message identity and each method's result identity, replaces a method result on retry, and reports a mismatched message/SPF evaluation as `none` instead of relabelling another message's identity. pvalue quoting, comments, multiple result entries and the empty `; none` form are unchanged.
 - DKIM1: `DkimSigningStream` hashed the body from the first `\r\n\r\n` instead of where the header section ends, so a header line without a colon or a bare LF empty line produced a body hash that did not verify.
 - DKIM2: a verification proof was accepted as covering a message parsed with `prepend_headers` it was not made for, so `Dkim2Signer` signed it without a new `Message-Instance` and the chain failed at the next hop (#69).
 - SPF: the `ptr` mechanism did not match a PTR name equal to `<target-name>`, or a subdomain of a macro-expanded `<target-name>`, because the trailing dot of the PTR record or of the expanded name was compared (#71).

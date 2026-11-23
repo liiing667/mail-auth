@@ -7,7 +7,7 @@
 //! DKIM1 verification results: [`DkimResult`] and [`DkimOutput`].
 
 use super::Signature;
-use crate::{DnsError, Error};
+use crate::{DnsError, Error, MessageIdentity};
 use std::fmt::Display;
 
 /// The outcome of verifying one DKIM1 signature, using the result names of
@@ -54,13 +54,27 @@ pub enum DkimResult {
 /// [`with_signature`](Self::with_signature) to synthesize an output, for
 /// example in tests or when feeding DMARC, which needs the signature's `d=`
 /// domain for alignment.
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, Clone)]
 pub struct DkimOutput<'x> {
     pub(crate) result: DkimResult,
     pub(crate) signature: Option<&'x Signature>,
     pub(crate) report: Option<String>,
     pub(crate) is_atps: bool,
+    /// Identity of the message revision this result was produced for. `None`
+    /// for an output synthesized outside a verifier.
+    pub(crate) message: Option<MessageIdentity>,
 }
+
+impl PartialEq for DkimOutput<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.result == other.result
+            && self.signature == other.signature
+            && self.report == other.report
+            && self.is_atps == other.is_atps
+    }
+}
+
+impl Eq for DkimOutput<'_> {}
 
 impl<'x> DkimOutput<'x> {
     pub(crate) fn pass() -> Self {
@@ -69,6 +83,7 @@ impl<'x> DkimOutput<'x> {
             signature: None,
             report: None,
             is_atps: false,
+            message: None,
         }
     }
 
@@ -78,6 +93,7 @@ impl<'x> DkimOutput<'x> {
             signature: None,
             report: None,
             is_atps: false,
+            message: None,
         }
     }
 
@@ -87,6 +103,7 @@ impl<'x> DkimOutput<'x> {
             signature: None,
             report: None,
             is_atps: false,
+            message: None,
         }
     }
 
@@ -96,6 +113,7 @@ impl<'x> DkimOutput<'x> {
             signature: None,
             report: None,
             is_atps: false,
+            message: None,
         }
     }
 
@@ -105,6 +123,7 @@ impl<'x> DkimOutput<'x> {
             signature: None,
             report: None,
             is_atps: false,
+            message: None,
         }
     }
 
@@ -128,6 +147,23 @@ impl<'x> DkimOutput<'x> {
     pub(crate) fn with_atps(mut self) -> Self {
         self.is_atps = true;
         self
+    }
+
+    /// Returns the identity of the message revision this result belongs to.
+    ///
+    /// `None` when the output was built outside a verifier, for example with
+    /// [`From<DkimResult>`](DkimOutput::from).
+    pub fn message_identity(&self) -> Option<MessageIdentity> {
+        self.message
+    }
+
+    /// Returns `true` when this result was produced for `message`.
+    ///
+    /// An output without recorded identity returns `true`, so synthetic
+    /// outputs remain usable with the historical API.
+    pub fn is_for_message(&self, message: &crate::AuthenticatedMessage<'_>) -> bool {
+        self.message
+            .is_none_or(|identity| identity == message.identity())
     }
 
     /// Returns the verification result.
@@ -166,6 +202,7 @@ impl From<DkimResult> for DkimOutput<'_> {
             signature: None,
             report: None,
             is_atps: false,
+            message: None,
         }
     }
 }

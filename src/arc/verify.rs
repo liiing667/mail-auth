@@ -62,6 +62,21 @@ impl MessageAuthenticator {
         C: DnsCache + 'x,
     {
         let params = params.into();
+        let identity = params.input.identity();
+        let mut output = self.verify_arc_inner(params).await;
+        if output.message.is_none() {
+            output.message = Some(identity);
+        }
+        output
+    }
+
+    async fn verify_arc_inner<'x, C>(
+        &self,
+        params: Parameters<'x, &'x AuthenticatedMessage<'x>, C>,
+    ) -> ArcOutput<'x>
+    where
+        C: DnsCache + 'x,
+    {
         let message = params.input;
         if message.has_arc_errors {
             let err = message
@@ -95,6 +110,7 @@ impl MessageAuthenticator {
         let mut output = ArcOutput {
             result: DkimResult::None,
             set: Vec::with_capacity(message.aar_headers.len() / 3),
+            message: None,
         };
 
         for (pos, ((seal_, signature_), results_)) in message

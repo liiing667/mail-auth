@@ -286,6 +286,10 @@ impl MessageAuthenticator {
             }
         }
 
+        let identity = message.identity();
+        for dkim in &mut output {
+            dkim.message = Some(identity);
+        }
         output
     }
 }

@@ -34,6 +34,7 @@ fn authentication_results() {
                     .into(),
                 report: None,
                 is_atps: false,
+                message: None,
             },
         ),
         (
@@ -52,6 +53,7 @@ fn authentication_results() {
                     .into(),
                 report: None,
                 is_atps: false,
+                message: None,
             },
         ),
         (
@@ -70,6 +72,7 @@ fn authentication_results() {
                     .into(),
                 report: None,
                 is_atps: true,
+                message: None,
             },
         ),
     ] {
@@ -147,6 +150,7 @@ fn authentication_results() {
             report: None,
             explanation: None,
             identity: None,
+            source: None,
         };
         auth_results = auth_results.with_spf_result(&output, &params);
         let received_spf = ReceivedSpf::new(&output, &params);
@@ -166,6 +170,7 @@ fn authentication_results() {
                 domain: "example.org".to_string(),
                 policy: Policy::None,
                 record: None,
+                message: None,
             },
         ),
         (
@@ -176,6 +181,7 @@ fn authentication_results() {
                 domain: "example.com".to_string(),
                 policy: Policy::Quarantine,
                 record: None,
+                message: None,
             },
         ),
         (
@@ -186,6 +192,7 @@ fn authentication_results() {
                 domain: "example.net".to_string(),
                 policy: Policy::Reject,
                 record: Some(Arc::new(DmarcRecord::parse(b"v=DMARC1; p=reject").unwrap())),
+                message: None,
             },
         ),
         (
@@ -196,6 +203,7 @@ fn authentication_results() {
                 domain: "example.net".to_string(),
                 policy: Policy::None,
                 record: None,
+                message: None,
             },
         ),
     ] {
@@ -223,6 +231,7 @@ fn authentication_results() {
             &ArcOutput {
                 result: arc,
                 set: vec![],
+                message: None,
             },
             remote_ip,
         );
@@ -357,6 +366,7 @@ fn dkim_result_header_injection() {
         signature: Some(&signature),
         report: None,
         is_atps: false,
+        message: None,
     };
     let auth_results =
         AuthenticationResults::new("mx.example.org").with_dkim_result(&output, "from@example.org");
@@ -381,6 +391,7 @@ fn dkim_result_header_i_quoted_local_part() {
         signature: Some(&signature),
         report: None,
         is_atps: false,
+        message: None,
     };
     let auth_results =
         AuthenticationResults::new("mx.example.org").with_dkim_result(&output, "from@example.org");
@@ -402,6 +413,7 @@ fn dkim_result_header_d_injection() {
         signature: Some(&signature),
         report: None,
         is_atps: false,
+        message: None,
     };
     let auth_results =
         AuthenticationResults::new("mx.example.org").with_dkim_result(&output, "from@example.org");
@@ -420,6 +432,7 @@ fn spf_result_header_injection() {
         report: None,
         explanation: None,
         identity: None,
+        source: None,
     };
     let auth_results = AuthenticationResults::new("mx.example.org").with_spf_result(
         &spf,
@@ -452,6 +465,7 @@ fn dmarc_result_header_injection() {
             domain: "evil.test\r\nX-Injected: yes".to_string(),
             policy: Policy::None,
             record: None,
+            message: None,
         });
     assert_eq!(auth_results.auth_results.matches("\r\n").count(), 1);
     let value = auth_results
@@ -470,6 +484,7 @@ fn received_spf_header_injection() {
         report: None,
         explanation: None,
         identity: None,
+        source: None,
     };
     let received_spf = ReceivedSpf::new(
         &spf,
@@ -504,5 +519,156 @@ fn dkim2_comment_is_escaped() {
     assert_eq!(
         auth_results.auth_results.rsplit_once("\tdkim2=").unwrap().1,
         "permerror (DKIM2-Signature i=2 MAIL FROM <alice\\(work\\)\\\\x@example.com> did not match)"
+    );
+}
+
+#[test]
+fn dmarc_retry_replaces_the_previous_result() {
+    let pass = DmarcOutput {
+        spf_result: DmarcResult::Pass,
+        dkim_result: DmarcResult::None,
+        domain: "example.org".to_string(),
+        policy: Policy::None,
+        record: None,
+        message: None,
+    };
+    let fail = DmarcOutput {
+        spf_result: DmarcResult::None,
+        dkim_result: DmarcResult::Fail(Error::NotAligned),
+        domain: "example.org".to_string(),
+        policy: Policy::Reject,
+        record: Some(Arc::new(DmarcRecord::parse(b"v=DMARC1; p=reject").unwrap())),
+        message: None,
+    };
+
+    let mut auth_results = AuthenticationResults::new("mx.example.org");
+    auth_results.set_dmarc_result(&pass);
+    auth_results.set_dmarc_result(&fail);
+
+    assert!(!auth_results.auth_results.contains("dmarc=pass"));
+    assert!(
+        auth_results
+            .auth_results
+            .contains("dmarc=fail (policy not aligned)")
+    );
+    assert_eq!(auth_results.auth_results.matches("\tdmarc=").count(), 1);
+}
+
+#[test]
+fn dmarc_retry_without_a_result_clears_the_previous_pass() {
+    let pass = DmarcOutput {
+        spf_result: DmarcResult::Pass,
+        dkim_result: DmarcResult::None,
+        domain: "example.org".to_string(),
+        policy: Policy::None,
+        record: None,
+        message: None,
+    };
+
+    let mut auth_results = AuthenticationResults::new("mx.example.org");
+    auth_results.set_dmarc_result(&pass);
+    auth_results.set_dmarc_result(&DmarcOutput::default());
+
+    assert!(!auth_results.auth_results.contains("dmarc=pass"));
+    assert!(auth_results.auth_results.contains("dmarc=none"));
+    assert_eq!(auth_results.auth_results.matches("\tdmarc=").count(), 1);
+}
+
+#[test]
+fn auth_results_reject_a_dmarc_output_from_another_message() {
+    let message_a = crate::AuthenticatedMessage::parse(
+        b"From: alice@example.org\r\nSubject: A\r\n\r\nA\r\n",
+    )
+    .unwrap();
+    let message_b = crate::AuthenticatedMessage::parse(
+        b"From: bob@example.net\r\nSubject: B\r\n\r\nB\r\n",
+    )
+    .unwrap();
+    let signature = Signature {
+        d: "example.org".into(),
+        s: "sel".into(),
+        ..Default::default()
+    };
+    let dkim = DkimOutput {
+        result: DkimResult::Pass,
+        signature: Some(&signature),
+        report: None,
+        is_atps: false,
+        message: Some(message_a.identity()),
+    };
+    let dmarc = DmarcOutput {
+        spf_result: DmarcResult::Pass,
+        dkim_result: DmarcResult::None,
+        domain: "example.net".to_string(),
+        policy: Policy::None,
+        record: None,
+        message: Some(message_b.identity()),
+    };
+
+    let auth_results = AuthenticationResults::new_for("mx.example.org", &message_a)
+        .with_dkim_result(&dkim, "alice@example.org")
+        .with_dmarc_result(&dmarc);
+
+    assert!(auth_results.auth_results.contains("dkim=pass"));
+    assert!(!auth_results.auth_results.contains("dmarc=pass"));
+    assert!(auth_results.auth_results.contains(
+        "dmarc=none (result belongs to another message instance)"
+    ));
+    assert!(
+        auth_results
+            .auth_results
+            .contains("header.from=example.org")
+    );
+}
+
+#[test]
+fn auth_results_reject_an_spf_output_from_another_evaluation() {
+    let params_a = SpfParameters::mail_from(
+        "192.0.2.1".parse().unwrap(),
+        "helo.example.org",
+        "mx.example.org",
+        "alice@example.org",
+    );
+    let params_b = SpfParameters::mail_from(
+        "192.0.2.2".parse().unwrap(),
+        "helo.example.net",
+        "mx.example.org",
+        "bob@example.net",
+    );
+    let output = SpfOutput {
+        result: SpfResult::Pass,
+        domain: "example.org".to_string(),
+        report: None,
+        explanation: None,
+        identity: Some(crate::spf::SpfIdentity::MailFrom),
+        source: Some(crate::spf::SpfSource::from_params(&params_a)),
+    };
+
+    let mut auth_results = AuthenticationResults::new("mx.example.org");
+    auth_results.set_spf_result(&output, &params_b);
+    assert!(!auth_results.auth_results.contains("spf=pass"));
+    assert!(auth_results.auth_results.contains(
+        "spf=none (result belongs to another SPF evaluation)"
+    ));
+    assert!(
+        auth_results
+            .auth_results
+            .contains("smtp.mailfrom=bob@example.net")
+    );
+
+    let received = ReceivedSpf::new(&output, &params_b);
+    assert!(received.received_spf.starts_with(
+        "none (mx.example.org: result belongs to another SPF evaluation)"
+    ));
+    assert!(received.received_spf.contains("client-ip=192.0.2.2"));
+}
+
+#[test]
+fn auth_results_empty_header_keeps_none() {
+    use crate::headers::HeaderWriter;
+
+    assert_eq!(
+        AuthenticationResults::new("mx.example.org").to_header(),
+        "Authentication-Results: mx.example.org; none\r\n"
     );
 }

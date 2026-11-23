@@ -7,7 +7,8 @@
 use super::{RR_FAIL, RR_NEUTRAL_NONE, RR_SOFTFAIL, RR_TEMP_PERM_ERROR, SpfRecord};
 use crate::Error;
 use crate::sampling::is_within_pct;
-use std::{fmt::Display, str::FromStr};
+use crate::spf::verify::SpfParameters;
+use std::{fmt::Display, net::IpAddr, str::FromStr};
 
 /// The result of an SPF check (RFC 7208, Section 2.6).
 ///
@@ -58,6 +59,9 @@ pub struct SpfOutput {
     pub(crate) report: Option<String>,
     pub(crate) explanation: Option<String>,
     pub(crate) identity: Option<SpfIdentity>,
+    /// The SMTP identity this check was evaluated for. `None` for an output
+    /// built outside a verifier.
+    pub(crate) source: Option<SpfSource>,
 }
 
 impl PartialEq for SpfOutput {
@@ -67,6 +71,63 @@ impl PartialEq for SpfOutput {
             && self.report == other.report
             && self.explanation == other.explanation
     }
+}
+
+/// The SMTP identity fixed by one SPF evaluation.
+///
+/// It binds the client address, the HELO and host domains and the MAIL FROM
+/// identity to the result, so a result obtained for one SMTP transaction can
+/// be recognized when it is presented for another. The type is an
+/// implementation detail of result reporting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SpfSource {
+    ip: IpAddr,
+    domain: Box<str>,
+    helo_domain: Box<str>,
+    host_domain: Box<str>,
+    mail_from: Option<Box<str>>,
+}
+
+impl SpfSource {
+    pub(crate) fn from_params(params: &SpfParameters<'_>) -> Self {
+        SpfSource {
+            ip: params.ip(),
+            domain: params.domain().into(),
+            helo_domain: params.helo_domain().into(),
+            host_domain: params.host_domain().into(),
+            mail_from: params.mail_from_address().map(Into::into),
+        }
+    }
+
+    pub(crate) fn matches(&self, params: &SpfParameters<'_>) -> bool {
+        let core = self.ip == params.ip()
+            && same_dns_name(&self.helo_domain, params.helo_domain())
+            && same_dns_name(&self.host_domain, params.host_domain());
+        if !core {
+            return false;
+        }
+        if params.is_helo_and_mail_from() {
+            // verify_spf() may return the HELO result (mail_from is None) or
+            // the MAIL FROM result. The caller still passes the combined
+            // parameters to the header writer, so both outputs belong to this
+            // SPF transaction.
+            match (&self.mail_from, params.mail_from_address()) {
+                (None, _) => true,
+                (Some(actual), Some(expected)) => {
+                    actual.as_ref() == expected
+                }
+                _ => false,
+            }
+        } else {
+            same_dns_name(&self.domain, params.domain())
+                && self.mail_from.as_deref() == params.mail_from_address()
+        }
+    }
+}
+
+fn same_dns_name(left: &str, right: &str) -> bool {
+    left.trim_end_matches('.')
+        .eq_ignore_ascii_case(right.trim_end_matches('.'))
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -103,11 +164,17 @@ impl SpfOutput {
             explanation: None,
             domain,
             identity: None,
+            source: None,
         }
     }
 
     pub(crate) fn with_identity(mut self, identity: SpfIdentity) -> Self {
         self.identity = Some(identity);
+        self
+    }
+
+    pub(crate) fn with_source(mut self, source: SpfSource) -> Self {
+        self.source = Some(source);
         self
     }
 
@@ -158,6 +225,19 @@ impl SpfOutput {
         self.result
     }
 
+    /// Returns `true` when this output was produced for `params`.
+    ///
+    /// The client address, HELO domain, host domain and MAIL FROM identity of
+    /// an output returned by a verifier are fixed for one SPF evaluation. An
+    /// output without recorded source returns `true`, so synthetic outputs
+    /// remain usable with the historical API.
+    pub fn is_for(&self, params: &SpfParameters<'_>) -> bool {
+        match &self.source {
+            Some(source) => source.matches(params),
+            None => true,
+        }
+    }
+
     /// Returns the domain that was checked: the HELO domain or the domain of
     /// the MAIL FROM address.
     pub fn domain(&self) -> &str {
@@ -185,6 +265,7 @@ impl Default for SpfOutput {
             report: Default::default(),
             explanation: Default::default(),
             identity: None,
+            source: None,
         }
     }
 }

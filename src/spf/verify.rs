@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0 OR MIT
  */
 
-use super::{Macro, Mechanism, Qualifier, SpfIdentity, SpfRecord, Variables};
+use super::{Macro, Mechanism, Qualifier, SpfIdentity, SpfRecord, SpfSource, Variables};
 use crate::DnsError;
 use crate::Instant;
 use crate::dns::{DnsCache, Negative, has_valid_labels};
@@ -176,7 +176,9 @@ impl MessageAuthenticator {
             Sender::MailFrom(sender) | Sender::Full(sender) => (*sender, SpfIdentity::MailFrom),
         };
 
-        let output = SpfOutput::new(domain.to_string()).with_identity(identity);
+        let output = SpfOutput::new(domain.to_string())
+            .with_identity(identity)
+            .with_source(SpfSource::from_params(&params.input));
         if domain.is_empty() || domain.len() > 255 || !has_valid_labels(domain) {
             return output.with_result(SpfResult::None);
         }
@@ -646,6 +648,10 @@ impl<'x> SpfParameters<'x> {
         self.ip
     }
 
+    pub(crate) fn domain(&self) -> &'x str {
+        self.domain
+    }
+
     pub(crate) fn helo_domain(&self) -> &'x str {
         self.helo_domain
     }
@@ -659,6 +665,10 @@ impl<'x> SpfParameters<'x> {
             Sender::Helo => None,
             Sender::MailFrom(sender) | Sender::Full(sender) => Some(sender),
         }
+    }
+
+    pub(crate) fn is_helo_and_mail_from(&self) -> bool {
+        matches!(self.sender, Sender::Full(_))
     }
 }
 

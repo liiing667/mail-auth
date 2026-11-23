@@ -30,7 +30,7 @@ pub mod parse;
 /// The `check_host()` function (RFC 7208, Section 4) and its parameters.
 pub mod verify;
 
-pub(crate) use output::SpfIdentity;
+pub(crate) use output::{SpfIdentity, SpfSource};
 pub use output::{SpfOutput, SpfResult};
 
 use std::{

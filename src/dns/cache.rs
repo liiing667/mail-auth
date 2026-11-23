@@ -121,6 +121,18 @@ pub trait ResolverCache<K, V>: Sized {
     /// from the TTLs of the DNS answer, or from its negative TTL for a
     /// negative answer.
     fn insert(&self, key: K, value: V, valid_until: Instant);
+
+    /// Returns an opaque generation for the cache contents.
+    ///
+    /// The default is `0`, which means the cache does not track a generation.
+    /// Implementations whose contents can be replaced or refreshed as a whole
+    /// should return a non-zero value that changes with those contents. A
+    /// verifier freezes the value it observes when it starts evaluating a
+    /// chain, so a retry cannot silently combine answers from two cache
+    /// generations.
+    fn generation(&self) -> u64 {
+        0
+    }
 }
 
 /// A set of DNS caches, one per record type, passed to verifiers through
@@ -233,6 +245,11 @@ impl<P> Parameters<'_, P, NoCache> {
     }
 }
 
+fn mix_cache_generation(version: &mut u64, versioned: &mut bool, generation: u64) {
+    *version = (*version).rotate_left(7) ^ generation;
+    *versioned |= generation != 0;
+}
+
 impl<'x, P, C: DnsCache> Parameters<'x, P, C> {
     /// Sets the DNS cache, replacing any cache set before.
     pub fn with_cache<NewC: DnsCache>(self, cache: &'x NewC) -> Parameters<'x, P, NewC> {
@@ -275,6 +292,53 @@ impl<'x, P, C: DnsCache> Parameters<'x, P, C> {
     pub(crate) fn ptr_cache(&self) -> Option<&'x C::Ptr> {
         self.cache.and_then(DnsCache::ptr)
     }
+
+    /// Returns an opaque generation for the cache set used by this call.
+    ///
+    /// The value combines the identity of the cache instance with the
+    /// per-record generations reported by [`ResolverCache::generation`].
+    /// `0` means that no cache was supplied. A verifier keeps the value it
+    /// observed when it started evaluating a chain, so a retry that sees a
+    /// different generation cannot combine answers from two cache
+    /// generations.
+    pub fn cache_generation(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+
+        let Some(cache) = self.cache else {
+            return 0;
+        };
+
+        // Distinguish cache instances even when they do not implement a
+        // per-record generation. The address is hashed so the value does not
+        // expose a raw pointer.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (cache as *const C as usize).hash(&mut hasher);
+        let instance = hasher.finish().max(1);
+
+        let mut version = 0u64;
+        let mut versioned = false;
+        if let Some(cache) = self.txt_cache() {
+            mix_cache_generation(&mut version, &mut versioned, cache.generation());
+        }
+        if let Some(cache) = self.mx_cache() {
+            mix_cache_generation(&mut version, &mut versioned, cache.generation());
+        }
+        if let Some(cache) = self.ipv4_cache() {
+            mix_cache_generation(&mut version, &mut versioned, cache.generation());
+        }
+        if let Some(cache) = self.ipv6_cache() {
+            mix_cache_generation(&mut version, &mut versioned, cache.generation());
+        }
+        if let Some(cache) = self.ptr_cache() {
+            mix_cache_generation(&mut version, &mut versioned, cache.generation());
+        }
+
+        if versioned {
+            instance ^ version.rotate_left(17)
+        } else {
+            instance
+        }
+    }
 }
 
 #[cfg(test)]
@@ -290,11 +354,17 @@ pub(crate) mod test {
         sync::Arc,
     };
 
-    pub(crate) struct DummyCache<K, V>(std::sync::Mutex<std::collections::HashMap<K, V>>);
+    pub(crate) struct DummyCache<K, V> {
+        entries: std::sync::Mutex<std::collections::HashMap<K, V>>,
+        generation: std::sync::atomic::AtomicU64,
+    }
 
     impl<K: Hash + Eq, V: Clone> DummyCache<K, V> {
         pub fn new() -> Self {
-            DummyCache(std::sync::Mutex::new(std::collections::HashMap::new()))
+            DummyCache {
+                entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+                generation: std::sync::atomic::AtomicU64::new(0),
+            }
         }
     }
 
@@ -304,7 +374,7 @@ pub(crate) mod test {
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
         {
-            self.0.lock().unwrap().get(key).cloned()
+            self.entries.lock().unwrap().get(key).cloned()
         }
 
         fn remove<Q>(&self, key: &Q) -> Option<V>
@@ -312,11 +382,23 @@ pub(crate) mod test {
             K: Borrow<Q>,
             Q: Hash + Eq + ?Sized,
         {
-            self.0.lock().unwrap().remove(key)
+            let removed = self.entries.lock().unwrap().remove(key);
+            if removed.is_some() {
+                self.generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            removed
         }
 
         fn insert(&self, key: K, value: V, _: std::time::Instant) {
-            self.0.lock().unwrap().insert(key, value);
+            self.entries.lock().unwrap().insert(key, value);
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn generation(&self) -> u64 {
+            self.generation
+                .load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 

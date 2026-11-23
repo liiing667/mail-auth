@@ -220,6 +220,10 @@ fn dkim2_check(output: &Dkim2Output<'_>, message: &AuthenticatedMessage<'_>) -> 
             "Provisional verification (-08 §13.2): only the most recent signature and \
              Message-Instance were checked",
         ),
+        Verification::Dsn => detail.push_str(
+            "DSN verification (-08 §16): the chain was checked against the envelope \
+             recorded in the most recent signature",
+        ),
     }
     if !top_err.is_empty() {
         let _ = write!(detail, "\n{top_err}");
@@ -392,6 +396,8 @@ fn dmarc_check(output: &mail_auth::DmarcOutput, dkim2: Option<&Dkim2Output<'_>>)
             .push_str("\nDKIM alignment also considers the i=1 DKIM2-Signature when DKIM2 passes"),
         Some(Verification::Provisional) => detail
             .push_str("\nA provisional DKIM2 verification does not take part in DMARC alignment"),
+        Some(Verification::Dsn) => detail
+            .push_str("\nA DSN DKIM2 verification does not take part in DMARC alignment"),
         None => {}
     }
     if output.record().is_none() {

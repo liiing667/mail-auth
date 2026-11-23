@@ -262,7 +262,10 @@ fn authentication_results() {
 fn dkim2_authentication_results() {
     use crate::{
         Dkim2Result,
-        dkim2::{ChainLink, Dkim2Error, Dkim2Hash, Dkim2Output, Signature as Dkim2Signature},
+        dkim2::{
+            ChainLink, Dkim2Error, Dkim2Hash, Dkim2Output, Signature as Dkim2Signature,
+            Verification,
+        },
     };
 
     let originator = Dkim2Signature {
@@ -323,6 +326,29 @@ fn dkim2_authentication_results() {
 
     let none: Dkim2Output = Dkim2Result::None.into();
 
+    // A pass that is not a full verification is not an authenticated
+    // identity: it is reported as dkim2=none, never as dkim2=pass.
+    let provisional_pass = Dkim2Output {
+        verification: Verification::Provisional,
+        chain: vec![ChainLink {
+            signature: &relay,
+            instance: None,
+            result: Dkim2Result::Pass,
+            custody_ok: true,
+        }],
+        ..Dkim2Output::from(Dkim2Result::Pass)
+    };
+    let dsn_pass = Dkim2Output {
+        verification: Verification::Dsn,
+        chain: vec![ChainLink {
+            signature: &relay,
+            instance: None,
+            result: Dkim2Result::Pass,
+            custody_ok: true,
+        }],
+        ..Dkim2Output::from(Dkim2Result::Pass)
+    };
+
     for (expected, output) in [
         ("dkim2=pass header.d=example.org header.i=1", &pass),
         (
@@ -334,6 +360,11 @@ fn dkim2_authentication_results() {
         ),
         ("dkim2=permerror (DKIM2-Signature i=1 missing)", &permerror),
         ("dkim2=none", &none),
+        (
+            "dkim2=none (provisional verification)",
+            &provisional_pass,
+        ),
+        ("dkim2=none (DSN verification)", &dsn_pass),
     ] {
         let auth_results = AuthenticationResults::new("mydomain.org").with_dkim2_result(output);
         assert_eq!(

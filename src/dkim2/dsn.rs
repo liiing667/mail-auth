@@ -420,7 +420,7 @@ impl MessageAuthenticator {
                 cache_txt,
                 now,
                 dsn.returned_full,
-                Verification::Full,
+                Verification::Dsn,
             )
             .await
             .result;

@@ -64,6 +64,13 @@ pub enum Verification {
     /// signature, that signature and the hashes of the most recent
     /// `Message-Instance`.
     Provisional,
+    /// The checks of §14 that apply to a message returned in a DSN (§16):
+    /// the whole chain is verified, but against the envelope recorded in
+    /// the most recent signature rather than the SMTP envelope the message
+    /// was received with, and body hashes only when the body was returned.
+    /// A pass is not a Fully Verified DKIM2 Message and is not an
+    /// authenticated identity.
+    Dsn,
 }
 
 /// Result of [`MessageAuthenticator::verify_dkim2`](crate::MessageAuthenticator::verify_dkim2)
@@ -106,7 +113,10 @@ impl<'x> Dkim2Output<'x> {
         &self.result
     }
 
-    /// Returns which checks were performed.
+    /// Returns which checks were performed. Only [`Verification::Full`]
+    /// makes a [`Dkim2Result::Pass`] a Fully Verified DKIM2 Message; a
+    /// provisional or DSN pass vouches for less and is reported as such
+    /// (it is never upgraded to a full pass).
     pub fn verification(&self) -> Verification {
         self.verification
     }

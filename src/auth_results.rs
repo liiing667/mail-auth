@@ -173,10 +173,28 @@ impl<'x> AuthenticationResults<'x> {
     /// The entry reports `header.d` (signing domain) and `header.i`
     /// (signature instance number) of the first link in the chain when the
     /// chain passed, or of the first link that did not pass otherwise. Both
-    /// are omitted for a provisional verification.
+    /// are omitted for a provisional or DSN verification.
+    ///
+    /// Only a full verification can be reported as `dkim2=pass`: a
+    /// provisional (§13.2) or DSN (§16) verification does not establish an
+    /// authenticated identity, so a pass at that level is reported as
+    /// `dkim2=none` and never upgraded.
     pub fn set_dkim2_result(&mut self, dkim2: &Dkim2Output) {
         self.auth_results.push_str(";\r\n\tdkim2=");
-        dkim2.result().as_auth_result(&mut self.auth_results);
+        match (dkim2.verification(), dkim2.result()) {
+            (Verification::Full, result) => result.as_auth_result(&mut self.auth_results),
+            (_, Dkim2Result::Pass) => {
+                // Not a Fully Verified DKIM2 Message: the checks that ran
+                // do not authenticate an identity, so this is not a pass.
+                self.auth_results.push_str("none");
+                self.auth_results.push_str(match dkim2.verification() {
+                    Verification::Provisional => " (provisional verification)",
+                    Verification::Dsn => " (DSN verification)",
+                    Verification::Full => unreachable!(),
+                });
+            }
+            (_, result) => result.as_auth_result(&mut self.auth_results),
+        }
 
         let link = if dkim2.verification() != Verification::Full {
             None

@@ -2088,6 +2088,7 @@ async fn provisional_chain_holds_only_top_signature() {
     );
     let provisional = verify(&parsed, envelope.0, &envelope.1, Verification::Provisional).await;
     assert_eq!(provisional.result(), &Dkim2Result::Pass);
+    assert_eq!(provisional.verification(), Verification::Provisional);
     assert_eq!(
         provisional
             .chain()
@@ -2097,10 +2098,109 @@ async fn provisional_chain_holds_only_top_signature() {
         vec![2]
     );
     let auth_results = AuthenticationResults::new("mx.example").with_dkim2_result(&provisional);
+    // A provisional pass is not an authenticated identity: it is reported
+    // as dkim2=none, never as dkim2=pass, and carries no header.d.
     assert!(
-        auth_results.auth_results.ends_with("dkim2=pass"),
+        auth_results
+            .auth_results
+            .ends_with("dkim2=none (provisional verification)"),
         "{}",
         auth_results.auth_results
+    );
+    assert!(!auth_results.auth_results.contains("header.d="));
+}
+
+// Only a full verification is dkim2=pass with an authenticated identity;
+// a provisional pass of the same message is dkim2=none without one.
+#[tokio::test]
+async fn only_full_verification_is_reported_as_pass() {
+    use crate::AuthenticationResults;
+
+    let original = original();
+    let message1 = prepend(
+        &signer("test1.dkim2.com")
+            .sign_at(
+                &original,
+                Hop::real("sender@test1.dkim2.com", ["recipient@example.com"]),
+                None,
+                NOW,
+            )
+            .unwrap(),
+        &original,
+    );
+    let parsed = AuthenticatedMessage::parse(&message1).unwrap();
+    let envelope = ("sender@test1.dkim2.com", ["recipient@example.com"]);
+
+    let full = verify(&parsed, envelope.0, &envelope.1, Verification::Full).await;
+    assert_eq!(full.result(), &Dkim2Result::Pass);
+    assert_eq!(full.verification(), Verification::Full);
+    let auth_results = AuthenticationResults::new("mx.example").with_dkim2_result(&full);
+    assert!(
+        auth_results
+            .auth_results
+            .ends_with("dkim2=pass header.d=test1.dkim2.com header.i=1"),
+        "{}",
+        auth_results.auth_results
+    );
+
+    let provisional = verify(&parsed, envelope.0, &envelope.1, Verification::Provisional).await;
+    assert_eq!(provisional.result(), &Dkim2Result::Pass);
+    assert_eq!(provisional.verification(), Verification::Provisional);
+    let auth_results = AuthenticationResults::new("mx.example").with_dkim2_result(&provisional);
+    let entry = auth_results.auth_results.rsplit_once(';').unwrap().1.trim();
+    assert_eq!(entry, "dkim2=none (provisional verification)");
+}
+
+// A verification asked to be full but run without the body is a DSN-level
+// verification: the result is recorded as such and is neither dkim2=pass
+// nor a proof of validity for the signer.
+#[tokio::test]
+async fn missing_body_is_not_a_full_pass() {
+    use crate::AuthenticationResults;
+
+    let original = original();
+    let message1 = prepend(
+        &signer("test1.dkim2.com")
+            .sign_at(
+                &original,
+                Hop::real("sender@test1.dkim2.com", ["recipient@example.com"]),
+                None,
+                NOW,
+            )
+            .unwrap(),
+        &original,
+    );
+    let parsed = AuthenticatedMessage::parse(&message1).unwrap();
+    let resolver = MessageAuthenticator::new_system_conf().unwrap();
+    let caches = load_caches();
+    let params = caches.parameters(&parsed);
+    let output = resolver
+        .verify_dkim2_(
+            &parsed,
+            Envelope::new("sender@test1.dkim2.com", ["recipient@example.com"]),
+            params.txt_cache(),
+            NOW,
+            false,
+            Verification::Full,
+        )
+        .await;
+    assert_eq!(output.result(), &Dkim2Result::Pass);
+    assert_eq!(output.verification(), Verification::Dsn);
+
+    let auth_results = AuthenticationResults::new("mx.example").with_dkim2_result(&output);
+    let entry = auth_results.auth_results.rsplit_once(';').unwrap().1.trim();
+    assert_eq!(entry, "dkim2=none (DSN verification)");
+
+    assert_eq!(
+        signer("test2.dkim2.com")
+            .sign_at(
+                &message1,
+                Hop::real("relay@test2.dkim2.com", ["fwd@example.org"]),
+                Some(&output),
+                NOW,
+            )
+            .unwrap_err(),
+        Error::Dkim2(Dkim2Error::NotFullyVerified)
     );
 }
 

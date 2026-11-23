@@ -182,6 +182,14 @@ impl MessageAuthenticator {
         A: AsRef<str>,
         R: IntoIterator<Item: AsRef<str>>,
     {
+        // The verification recorded in the output is the one whose checks
+        // were actually performed: a full verification needs the body, so
+        // without it the result is a DSN-level verification (§16) and can
+        // never be upgraded to a full pass.
+        let verification = match (verification, body_present) {
+            (Verification::Full, false) => Verification::Dsn,
+            (verification, _) => verification,
+        };
         let result = self
             .verify_chain(
                 message,
@@ -195,7 +203,7 @@ impl MessageAuthenticator {
         let signatures = message.dkim2_signatures.as_slice();
         let instances = message.dkim2_instances.as_slice();
         let verified = match verification {
-            Verification::Full => signatures,
+            Verification::Full | Verification::Dsn => signatures,
             Verification::Provisional => signatures
                 .len()
                 .checked_sub(1)
@@ -281,7 +289,7 @@ impl MessageAuthenticator {
         check_envelope(top, envelope).map_err(fail)?;
 
         match verification {
-            Verification::Full => {
+            Verification::Full | Verification::Dsn => {
                 for header in signatures {
                     check_mail_from_domain(&header.header).map_err(fail)?;
                 }
@@ -295,11 +303,13 @@ impl MessageAuthenticator {
         }
 
         let checked = match verification {
-            Verification::Full => signatures,
+            Verification::Full | Verification::Dsn => signatures,
             Verification::Provisional => signatures.get(previous.len()..).unwrap_or_default(),
         };
         match verification {
-            Verification::Full => check_instances(message, signatures, instances, body_present),
+            Verification::Full | Verification::Dsn => {
+                check_instances(message, signatures, instances, body_present)
+            }
             Verification::Provisional => instances.last().map_or(Ok(()), |header| {
                 StateHashes::for_message(message).check(
                     &header.header,

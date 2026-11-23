@@ -19,6 +19,9 @@ use std::{borrow::Cow, net::Ipv4Addr, sync::Arc};
 const DMARC_PREFIX: &str = "_dmarc.";
 const REPORT_PREFIX: &str = "._report._dmarc.";
 
+mod report_tx;
+use report_tx::ReportAuthorization;
+
 /// Input of [`MessageAuthenticator::verify_dmarc`]: the message and the
 /// results of the underlying authentication checks.
 ///
@@ -311,13 +314,27 @@ impl MessageAuthenticator {
     /// an external destination, when a `v=DMARC1` TXT record exists at
     /// `<policy_domain>._report._dmarc.<destination_domain>`. One TXT lookup
     /// is performed per external address. Addresses are returned in input
-    /// order.
+    /// order, one entry per authorized input address.
+    ///
+    /// The whole check runs as one authorization transaction. The policy
+    /// domain, every report URI, its external-authorization TXT record and
+    /// the final destination decision share the same transaction: the answers
+    /// consulted for the individual destinations are staged in a private
+    /// snapshot and are only published to the shared TXT cache once every
+    /// destination has been evaluated. Authorization answers are keyed by the
+    /// full `<policy_domain>._report._dmarc.<destination_domain>` name, so a
+    /// destination can never borrow the record that authorizes another
+    /// destination or another policy domain, and neither `rua`/`ruf`
+    /// evaluations nor retries can observe a half-finished run.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Dns`] with [`DnsError::Resolver`] when a lookup fails
-    /// with a transient resolver error. A missing or invalid authorization
-    /// record is not an error: the address is left out.
+    /// with a transient resolver error (TempError). In that case none of the
+    /// answers consulted during the run are published to the shared cache, so
+    /// a retry starts from the cache state observed before the failed run. A
+    /// missing or invalid authorization record is not an error: the address
+    /// is left out.
     ///
     /// # Example
     ///
@@ -351,6 +368,12 @@ impl MessageAuthenticator {
         let domain = domain.as_ref();
         let mut result = Vec::with_capacity(addresses.len());
         let mut key = String::new();
+        // One call is one authorization transaction: every external-
+        // authorization lookup is staged behind this write gate and only
+        // committed after all destinations have been evaluated. A transient
+        // error returns early and drops the staging area, so the shared cache
+        // never receives an answer belonging to an unfinished transaction.
+        let mut transaction = ReportAuthorization::new(txt_cache);
         for address in addresses {
             let address_ref = address.as_ref();
             let address_domain = to_a_label(
@@ -371,7 +394,8 @@ impl MessageAuthenticator {
                 key.push_str(REPORT_PREFIX);
                 key.push_str(address_domain);
                 key.push('.');
-                match self.txt_lookup::<DmarcRecord>(&key, txt_cache).await {
+                let gate = transaction.gate();
+                match self.txt_lookup::<DmarcRecord>(&key, Some(&gate)).await {
                     Ok(_) => true,
                     Err(err @ Error::Dns(DnsError::Resolver(_))) => return Err(err),
                     _ => false,
@@ -382,6 +406,9 @@ impl MessageAuthenticator {
             }
         }
 
+        // Every destination was evaluated without a transient error: publish
+        // the authorization answers as one atomic transaction.
+        transaction.commit();
         Ok(result)
     }
 
